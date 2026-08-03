@@ -583,10 +583,9 @@ mod tests {
             values[r] = r as i64;
             r += 1;
         }
-        // Poison beyond the live window — scalar/SIMD must not clear these via overrun.
         values[15] = 999;
         let mut sel = SelectionVector::all(15);
-        sel.mask[15] = 0xAB; // sentinel outside live window
+        sel.mask[15] = 0xAB;
         Engine::filter_i64_gt(&values, &mut sel, 15, 7);
         let mut i = 0usize;
         while i < 8 {
@@ -598,5 +597,27 @@ mod tests {
             i += 1;
         }
         assert_eq!(sel.mask[15], 0xAB, "must not clobber past live row count");
+    }
+
+    #[test]
+    fn scalar_cleanup_after_full_batch_1025_rows() {
+        const LIVE: usize = 1025;
+        let mut values = [0i64; MAX_ROWS];
+        let mut i = 0usize;
+        while i < LIVE {
+            values[i] = 1;
+            i += 1;
+        }
+        values[1024] = 42; // the single scalar-tail row
+        let mut sel = SelectionVector::all(LIVE);
+        Engine::filter_i64_eq(&values, &mut sel, LIVE, 42);
+        let mut kept = 0usize;
+        let mut r = 0usize;
+        while r < LIVE {
+            kept += sel.mask[r] as usize;
+            r += 1;
+        }
+        assert_eq!(kept, 1);
+        assert_eq!(sel.mask[1024], 1);
     }
 }

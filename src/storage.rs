@@ -15,8 +15,8 @@ pub const BATCH_ROWS: usize = 1024;
 /// Maximum columns in a table schema.
 pub const MAX_COLUMNS: usize = 8;
 
-/// Maximum rows in an in-core table segment.
-pub const MAX_ROWS: usize = 1024;
+/// Maximum rows in an in-core table segment (supports multi-batch + scalar tail).
+pub const MAX_ROWS: usize = 2048;
 
 /// Maximum bytes in the shared UTF-8 data slab for Utf8 columns.
 pub const UTF8_SLAB_CAP: usize = 4096;

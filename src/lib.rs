@@ -19,7 +19,9 @@ pub mod storage;
 pub mod utf8;
 
 pub use lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
-pub use parser::{parse_query, AstArena, AstNode, NodeKind, ParseError, Parser, AST_CAP, NIL};
+pub use parser::{
+    parse_query, AstArena, AstNode, NodeKind, ParseError, Parser, ParserError, AST_CAP, NIL,
+};
 pub use runtime::{demo_catalog, run_query, Engine, QueryResult};
 pub use storage::{
     seed_users_table, Catalog, ColName, ColumnData, PhysType, SelectionVector, Table, BATCH_ROWS,
@@ -208,11 +210,11 @@ mod e2e_tests {
         let mut arena = AstArena::new();
         arena.len = AST_CAP as u32;
         let err = parse_query(q, &mut arena).expect_err("saturated arena must error");
-        assert_eq!(err, ParseError::ArenaOverflow);
+        assert_eq!(err, ParserError::ArenaFull);
         assert!(arena.is_full());
         // try_alloc itself is bounds-safe.
         let again = arena.try_alloc(AstNode::empty());
-        assert_eq!(again, Err(ParseError::ArenaOverflow));
+        assert_eq!(again, Err(ParserError::ArenaFull));
     }
 
     /// 3. Chunk-tail scalar protection for non-1024 / non-8 row counts.
@@ -286,7 +288,7 @@ mod e2e_tests {
         let torn = &full[..the_off + 4];
         let mut arena = AstArena::new();
         let err = parse_query(torn, &mut arena).expect_err("parse must surface lex fault");
-        assert_eq!(err, ParseError::LexMalformedUtf8);
+        assert_eq!(err, ParserError::LexMalformedUtf8);
         assert_eq!(arena.root, NIL);
         // run_query maps the fault to false without aborting the process.
         let cat = demo_catalog();
@@ -294,5 +296,154 @@ mod e2e_tests {
         let mut arena2 = AstArena::new();
         assert!(parse_query(&"தே".as_bytes()[..4], &mut arena2).is_err());
         let _ = cat;
+    }
+
+    // ── Ω-INF stress harness (additional production edge cases) ───────────
+
+    /// Fragmented input: query cuts off mid-stream after `வடி வய` (incomplete
+    /// filter / torn trailing Tamil sequence). Must yield a clean defensive error.
+    #[test]
+    fn omega_fragmented_input_mid_tamil_clean_error() {
+        let frag = "இருந்து பயனர்கள் | வடி வய";
+        let mut arena = AstArena::new();
+        let err = parse_query(frag.as_bytes(), &mut arena).expect_err("incomplete filter");
+        assert!(
+            matches!(
+                err,
+                ParserError::UnexpectedToken
+                    | ParserError::LexMalformedUtf8
+                    | ParserError::EmptyInput
+            ),
+            "unexpected error variant: {err:?}"
+        );
+        assert_eq!(arena.root, NIL);
+
+        // Explicit mid-codepoint cut of the trailing ய (3-byte Tamil) → MalformedUtf8.
+        let bytes = frag.as_bytes();
+        let torn = &bytes[..bytes.len() - 1];
+        let mut lex = Lexer::new(torn);
+        let mut saw_malformed = false;
+        loop {
+            match lex.next_token() {
+                Ok(t) if t.kind == TokenKind::Eof => break,
+                Ok(_) => {}
+                Err(LexerError::MalformedUtf8) => {
+                    saw_malformed = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected lexer fault: {e:?}"),
+            }
+        }
+        assert!(saw_malformed);
+    }
+
+    /// Maximum stress: chain enough `| வடி …` stages to exceed the 1024-node arena.
+    #[test]
+    fn omega_maximum_stress_arena_full_on_pipeline_chain() {
+        let mut q = String::from("இருந்து பயனர்கள்");
+        // Each filter stage allocates Ident + Literal + BinOp + Filter (= 4 nodes).
+        // From allocates Ident + From (= 2) and Pipeline root (= 1) ⇒ ~4n+3 nodes.
+        // n = 300 ⇒ ~1203 nodes > AST_CAP (1024).
+        let mut i = 0usize;
+        while i < 300 {
+            q.push_str(" | வடி வயது > 0");
+            i += 1;
+        }
+        q.push(';');
+
+        let mut arena = Box::new(AstArena::new());
+        let err = parse_query(q.as_bytes(), &mut arena).expect_err("must hit ArenaFull");
+        assert_eq!(err, ParserError::ArenaFull);
+        assert!(arena.is_full() || arena.len as usize >= AST_CAP);
+    }
+
+    /// Non-aligned remainder: 1025 rows ⇒ one full SIMD batch + 1 scalar tail row.
+    #[test]
+    fn omega_non_aligned_1025_row_scalar_cleanup() {
+        const LIVE: usize = 1025;
+        assert!(LIVE > BATCH_ROWS);
+        assert_eq!(LIVE % BATCH_ROWS, 1);
+
+        let mut values = [0i64; MAX_ROWS];
+        let mut i = 0usize;
+        while i < LIVE {
+            values[i] = i as i64;
+            i += 1;
+        }
+        // Poison past live window.
+        values[LIVE] = -999;
+        let mut sel = SelectionVector::all(LIVE);
+        sel.mask[LIVE] = 0xA5;
+
+        // Keep only the trailing scalar-tail record (row 1024).
+        Engine::filter_i64_eq(&values, &mut sel, LIVE, 1024);
+
+        let mut r = 0usize;
+        while r < LIVE {
+            let expect = if r == 1024 { 1u8 } else { 0u8 };
+            assert_eq!(sel.mask[r], expect, "row {r}");
+            r += 1;
+        }
+        assert_eq!(sel.mask[LIVE], 0xA5, "must not clobber past 1025 live rows");
+
+        // Full end-to-end against a 1025-row mock relation.
+        let mut table = Table::new("பயனர்கள்".as_bytes());
+        let age_i = table.add_int64_column("வயது".as_bytes()).unwrap();
+        let name_i = table.add_utf8_column("பெயர்".as_bytes()).unwrap();
+        {
+            let col = table.int64_mut(age_i).unwrap();
+            let mut r = 0usize;
+            while r < LIVE {
+                col.values[r] = r as i64;
+                col.validity.set(r, true);
+                r += 1;
+            }
+        }
+        {
+            let col = table.utf8_mut(name_i).unwrap();
+            col.clear();
+            // Minimal utf8 payloads — one byte labels cycling 0-9 for slab budget.
+            let mut r = 0usize;
+            while r < LIVE {
+                let b = [b'0' + (r % 10) as u8];
+                assert!(col.set_row(r, &b));
+                r += 1;
+            }
+        }
+        table.set_row_count(LIVE);
+
+        let mut cat = Catalog::new();
+        let _ = cat.register(table);
+        let q = "இருந்து பயனர்கள் | வடி வயது > 1023 | தேடு வயது;";
+        let mut arena = Box::new(AstArena::new());
+        let mut out = Box::new(QueryResult::new());
+        assert!(run_query(q, &cat, &mut arena, &mut out));
+        assert_eq!(out.row_count, 1);
+        assert_eq!(out.int_out[0].values[0], 1024);
+    }
+
+    /// Empty / adversarial whitespace-only input (VT, CR, LF alternating).
+    #[test]
+    fn omega_empty_input_vt_cr_lf_whitespace_lut() {
+        let ws: &[u8] = b"\x0B\r\n\x0B\r\n\x0C\t \r\n\x0B";
+        let mut lex = Lexer::new(ws);
+        let tok = lex.next_token().expect("whitespace-only must not fault");
+        assert_eq!(tok.kind, TokenKind::Eof);
+
+        let mut arena = AstArena::new();
+        let err = parse_query(ws, &mut arena).expect_err("no pipeline stages");
+        assert_eq!(err, ParserError::EmptyInput);
+
+        // Zero-heap hot path still holds on the canonical demo query.
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = Box::new(QueryResult::new());
+        reset_counters();
+        set_tracking(true);
+        let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out);
+        set_tracking(false);
+        assert!(ok);
+        assert_eq!(alloc_count(), 0);
+        assert_eq!(alloc_bytes(), 0);
     }
 }

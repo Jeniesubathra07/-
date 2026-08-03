@@ -13,7 +13,8 @@ use crate::utf8::{
 };
 
 /// Maximum tokens emitted into the fixed token buffer by a single scan.
-pub const MAX_TOKENS: usize = 256;
+/// Sized to allow stress pipelines that saturate the 1024-node AST arena.
+pub const MAX_TOKENS: usize = 4096;
 
 /// Defensive lexer failure modes (no panics on adversarial input).
 #[repr(u8)]

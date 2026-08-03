@@ -28,12 +28,15 @@ pub const UTF8_LEN_LUT: [u8; 256] = {
 };
 
 /// True when the byte is an ASCII whitespace (branchless via LUT).
+/// Includes VT (`\x0B`) and FF (`\x0C`) for adversarial layout streams.
 pub const IS_WS_LUT: [u8; 256] = {
     let mut t = [0u8; 256];
     t[b' ' as usize] = 1;
     t[b'\t' as usize] = 1;
     t[b'\n' as usize] = 1;
     t[b'\r' as usize] = 1;
+    t[0x0B] = 1; // vertical tab
+    t[0x0C] = 1; // form feed
     t
 };
 
