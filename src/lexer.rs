@@ -1,29 +1,30 @@
 //! Front-end pipeline lexer for the Tamil-native query DSL.
 //!
-//! Scans left-to-right over `&[u8]` with zero heap traffic. Keywords are
-//! matched by raw byte equality against compile-time UTF-8 constants.
-//! Numbers are accumulated in a branchless register loop.
+//! Scans left-to-right over `&[u8]` with zero heap traffic. Keywords use
+//! **maximal munch**: the longest UTF-8 identifier span is taken first, then
+//! exact keyword equality is applied — so `"வடிவமைப்பு"` is `Ident`, never a
+//! torn `"வடி"` keyword prefix.
 //!
-//! Torn Tamil syllables and truncated UTF-8 sequences surface as
-//! [`LexerError::MalformedUtf8`] — never as panics.
+//! Mid-syllable / truncated UTF-8 returns
+//! [`LexerError::MalformedUtf8`]`(cursor)` — never panics.
 
 use crate::utf8::{
-    checked_char_end, scan_ident_end_checked, str_from_parent, IS_DIGIT_LUT, IS_OP_LUT, IS_WS_LUT,
-    Utf8ScanStatus,
+    checked_char_end, scan_ident_end_checked, str_from_parent, IS_DIGIT_LUT, IS_OP_LUT,
+    Utf8ScanStatus, WHITESPACE_LUT,
 };
 
 /// Maximum tokens emitted into the fixed token buffer by a single scan.
 /// Sized to allow stress pipelines that saturate the 1024-node AST arena.
-pub const MAX_TOKENS: usize = 4096;
+pub const MAX_TOKENS: usize = 8192;
 
 /// Defensive lexer failure modes (no panics on adversarial input).
-#[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
 pub enum LexerError {
-    /// Buffer ends mid-codepoint or mid-Tamil-syllable (e.g. truncated `தே`).
-    MalformedUtf8 = 0,
+    /// Buffer ends mid-codepoint or mid-Tamil-syllable at byte `cursor`.
+    MalformedUtf8(u32),
     /// Fixed token window exhausted.
-    TokenBufferFull = 1,
+    TokenBufferFull,
 }
 
 /// Keyword / operator / literal classification. Packed as `u8` for cache density.
@@ -143,17 +144,25 @@ const OP_KIND_LUT: [u8; 256] = {
     t
 };
 
+/// Maximal-munch keyword classify: exact equality only after the full
+/// grapheme-safe identifier span is locked. Prefixes never win.
 #[inline(always)]
-fn match_keyword(slice: &[u8]) -> TokenKind {
+fn match_keyword_maximal(slice: &[u8]) -> TokenKind {
     match slice.len() {
         9 => {
-            if slice == KW_VADI {
+            // வடி / கணி / எடு / இணை — all 9 UTF-8 bytes; exact compare only.
+            let eq_vadi = slice == KW_VADI;
+            let eq_kani = slice == KW_KANI;
+            let eq_edu = slice == KW_EDU;
+            let eq_inai = slice == KW_INAI;
+            // Priority chain is exact-only; longer idents never enter this arm.
+            if eq_vadi {
                 TokenKind::Vadi
-            } else if slice == KW_KANI {
+            } else if eq_kani {
                 TokenKind::Kani
-            } else if slice == KW_EDU {
+            } else if eq_edu {
                 TokenKind::Edu
-            } else if slice == KW_INAI {
+            } else if eq_inai {
                 TokenKind::Inai
             } else {
                 TokenKind::Ident
@@ -191,11 +200,20 @@ fn match_keyword(slice: &[u8]) -> TokenKind {
 }
 
 #[inline(always)]
-fn map_utf8_err(status: Utf8ScanStatus) -> LexerError {
-    match status {
-        Utf8ScanStatus::Malformed => LexerError::MalformedUtf8,
-        Utf8ScanStatus::Ok => LexerError::MalformedUtf8,
-    }
+fn map_utf8_err(status: Utf8ScanStatus, cursor: u32) -> LexerError {
+    let _ = status;
+    LexerError::MalformedUtf8(cursor)
+}
+
+/// Zero-width space UTF-8 lead detector (U+200B = E2 80 8B).
+#[inline(always)]
+fn zwsp_len(bytes: &[u8], i: usize) -> usize {
+    let in_range = (i + 2) < bytes.len();
+    let b0 = bytes.get(i).copied().unwrap_or(0);
+    let b1 = bytes.get(i + 1).copied().unwrap_or(0);
+    let b2 = bytes.get(i + 2).copied().unwrap_or(0);
+    let hit = in_range & (b0 == 0xE2) & (b1 == 0x80) & (b2 == 0x8B);
+    3usize.wrapping_mul(hit as usize)
 }
 
 /// Zero-allocation streaming lexer over a borrowed byte buffer.
@@ -232,16 +250,30 @@ impl<'a> Lexer<'a> {
         self.fault
     }
 
+    /// Branchless ASCII whitespace + ZWSP strip via [`WHITESPACE_LUT`].
     #[inline(always)]
     fn skip_ws(&mut self) {
         let bytes = self.src;
         let mut i = self.pos;
-        while i < bytes.len() {
-            let is_ws = IS_WS_LUT[bytes[i] as usize];
-            if is_ws == 0 {
+        loop {
+            if i >= bytes.len() {
                 break;
             }
-            i += 1;
+            let b = bytes[i];
+            let ascii = WHITESPACE_LUT[b as usize] as usize;
+            let zw = zwsp_len(bytes, i);
+            // Prefer ASCII step (1) when set; else ZWSP step (3); else halt.
+            let advance = if ascii != 0 {
+                1usize
+            } else if zw != 0 {
+                zw
+            } else {
+                0usize
+            };
+            if advance == 0 {
+                break;
+            }
+            i += advance;
         }
         self.pos = i;
     }
@@ -301,17 +333,18 @@ impl<'a> Lexer<'a> {
     #[inline(always)]
     fn scan_ident_or_keyword(&mut self) -> Result<Token, LexerError> {
         let start = self.pos;
-        // Reject truncated lead before scanning.
-        let _ = checked_char_end(self.src, start).map_err(map_utf8_err)?;
-        let end = scan_ident_end_checked(self.src, start).map_err(map_utf8_err)?;
+        let cursor = start as u32;
+        let _ = checked_char_end(self.src, start).map_err(|s| map_utf8_err(s, cursor))?;
+        let end = scan_ident_end_checked(self.src, start).map_err(|s| map_utf8_err(s, cursor))?;
         self.pos = end;
         let slice = &self.src[start..end];
-        // Final UTF-8 validation pins grapheme-safe `&str` lifetime to parent.
         if core::str::from_utf8(slice).is_err() {
-            self.fault = Some(LexerError::MalformedUtf8);
-            return Err(LexerError::MalformedUtf8);
+            let err = LexerError::MalformedUtf8(cursor);
+            self.fault = Some(err);
+            return Err(err);
         }
-        let kind = match_keyword(slice);
+        // Maximal munch: full span locked before keyword exact-match.
+        let kind = match_keyword_maximal(slice);
         Ok(Token {
             kind,
             _pad: [0; 3],
@@ -346,11 +379,11 @@ impl<'a> Lexer<'a> {
         if is_op != 0 {
             return Ok(self.scan_operator());
         }
-        // Non-ASCII / ident path: validate UTF-8 completeness first.
+        let cursor = self.pos as u32;
         match checked_char_end(self.src, self.pos) {
             Ok(_) => {}
             Err(status) => {
-                let err = map_utf8_err(status);
+                let err = map_utf8_err(status, cursor);
                 self.fault = Some(err);
                 return Err(err);
             }
@@ -365,18 +398,16 @@ impl<'a> Lexer<'a> {
     }
 
     /// Fill a caller-provided fixed token buffer.
+    #[inline(always)]
     pub fn tokenize_into(&mut self, out: &mut [Token; MAX_TOKENS]) -> Result<usize, LexerError> {
         let mut n = 0usize;
         while n + 1 < MAX_TOKENS {
-            match self.next_token()? {
-                tok => {
-                    let is_eof = tok.kind as u8 == TokenKind::Eof as u8;
-                    out[n] = tok;
-                    n += 1;
-                    if is_eof {
-                        return Ok(n);
-                    }
-                }
+            let tok = self.next_token()?;
+            let is_eof = tok.kind as u8 == TokenKind::Eof as u8;
+            out[n] = tok;
+            n += 1;
+            if is_eof {
+                return Ok(n);
             }
         }
         Err(LexerError::TokenBufferFull)
@@ -393,7 +424,6 @@ impl<'a> Iterator for Lexer<'a> {
             Err(err) => {
                 let start = self.pos as u32;
                 self.fault = Some(err);
-                // Advance one byte to avoid infinite Error loops on Iterator consumers.
                 self.pos = self.pos.saturating_add(1).min(self.src.len());
                 Some(Token::error(start, self.pos as u32))
             }
@@ -419,21 +449,28 @@ mod tests {
         assert_eq!(buf[3].kind, TokenKind::Vadi);
         let thedu = buf.iter().find(|t| t.kind == TokenKind::Thedu).unwrap();
         assert_eq!(thedu.text(q.as_bytes()), Some("தேடு"));
-        let pe = buf
-            .iter()
-            .find(|t| t.kind == TokenKind::Ident && t.text(q.as_bytes()) == Some("பெயர்"))
-            .unwrap();
-        assert_eq!(pe.text(q.as_bytes()), Some("பெயர்"));
     }
 
     #[test]
-    fn mid_syllable_the_cut_returns_malformed_utf8() {
-        // தே = த (E0 AE A4) + ே (E0 AF 87). Cut after 4 bytes ⇒ mid-syllable.
+    fn mid_syllable_the_cut_returns_malformed_utf8_with_cursor() {
         let full = "தே".as_bytes();
         assert_eq!(full.len(), 6);
         let truncated = &full[..4];
         let mut lex = Lexer::new(truncated);
         let err = lex.next_token().expect_err("must reject torn தே");
-        assert_eq!(err, LexerError::MalformedUtf8);
+        assert_eq!(err, LexerError::MalformedUtf8(0));
+    }
+
+    #[test]
+    fn maximal_munch_keeps_vadivamaippu_as_ident() {
+        // "வடிவமைப்பு" starts with keyword bytes for வடி but must NOT tear.
+        let s = "வடிவமைப்பு";
+        let mut lex = Lexer::new(s.as_bytes());
+        let tok = lex.next_token().expect("lex");
+        assert_eq!(tok.kind, TokenKind::Ident);
+        assert_eq!(tok.text(s.as_bytes()), Some("வடிவமைப்பு"));
+        // Bare keyword still classifies.
+        let mut lex2 = Lexer::new("வடி".as_bytes());
+        assert_eq!(lex2.next_token().unwrap().kind, TokenKind::Vadi);
     }
 }

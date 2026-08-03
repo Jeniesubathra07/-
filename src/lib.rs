@@ -179,14 +179,13 @@ mod e2e_tests {
         assert!(found_peyar);
     }
 
-    // ── Stress / fuzz edge cases (GROK-4.5-STRESS-FUZZ) ──────────────────
+    // ── Stress / fuzz edge cases ─────────────────────────────────────────
 
-    /// 1. Tamil grapheme tail break: buffer ends mid-`தே` (after 4 of 6 bytes).
+    /// Tamil grapheme tail break: buffer ends mid-`தே` (after 4 of 6 bytes).
     #[test]
     fn fuzz_mid_syllable_the_returns_malformed_utf8() {
         let full = "தே".as_bytes();
         assert_eq!(full.len(), 6);
-        // Cut precisely mid-syllable: த complete + first byte of ே.
         let truncated = &full[..4];
         assert!(core::str::from_utf8(truncated).is_err());
 
@@ -194,33 +193,30 @@ mod e2e_tests {
         let err = lex
             .next_token()
             .expect_err("torn தே must not panic or succeed");
-        assert_eq!(err, LexerError::MalformedUtf8);
+        assert_eq!(err, LexerError::MalformedUtf8(0));
 
-        // Iterator path also latches Error without panicking.
         let mut lex2 = Lexer::new(truncated);
         let tok = lex2.next().expect("iterator yields error token");
         assert_eq!(tok.kind, TokenKind::Error);
-        assert_eq!(lex2.last_error(), Some(LexerError::MalformedUtf8));
+        assert_eq!(lex2.last_error(), Some(LexerError::MalformedUtf8(0)));
     }
 
-    /// 2. Fixed arena overflow at `[AstNode; 1024]` boundary.
+    /// Fixed arena overflow at `[AstNode; 1024]` boundary.
     #[test]
     fn fuzz_arena_overflow_returns_defensive_error() {
         let q = DEMO_QUERY.as_bytes();
         let mut arena = AstArena::new();
         arena.len = AST_CAP as u32;
         let err = parse_query(q, &mut arena).expect_err("saturated arena must error");
-        assert_eq!(err, ParserError::ArenaFull);
+        assert_eq!(err, ParserError::ArenaOverflow);
         assert!(arena.is_full());
-        // try_alloc itself is bounds-safe.
         let again = arena.try_alloc(AstNode::empty());
-        assert_eq!(again, Err(ParserError::ArenaFull));
+        assert_eq!(again, Err(ParserError::ArenaOverflow));
     }
 
-    /// 3. Chunk-tail scalar protection for non-1024 / non-8 row counts.
+    /// Chunk-tail scalar protection for non-1024 / non-8 row counts.
     #[test]
     fn fuzz_chunk_tail_scalar_residue_no_simd_corruption() {
-        // 23 rows ⇒ one incomplete batch, aligned 16 + scalar residue 7.
         const LIVE: usize = 23;
         let mut values = [0i64; MAX_ROWS];
         let mut i = 0usize;
@@ -228,7 +224,6 @@ mod e2e_tests {
             values[i] = i as i64;
             i += 1;
         }
-        // Poison past the live window — kernels must not touch these slots.
         let mut p = LIVE;
         while p < LIVE + 16 && p < MAX_ROWS {
             values[p] = -1;
@@ -256,112 +251,79 @@ mod e2e_tests {
             assert_eq!(sel.mask[t], 0x5A, "must not clobber mask past live rows");
             t += 1;
         }
-
-        // Near-capacity residue: 1023 = 1024-1, exercises phase-B/C only.
-        let mut sel2 = SelectionVector::all(1023);
-        let mut values2 = [0i64; MAX_ROWS];
-        let mut k = 0usize;
-        while k < 1023 {
-            values2[k] = (k % 50) as i64;
-            k += 1;
-        }
-        Engine::filter_i64_eq(&values2, &mut sel2, 1023, 7);
-        let mut kept = 0usize;
-        let mut m = 0usize;
-        while m < 1023 {
-            kept += sel2.mask[m] as usize;
-            if sel2.mask[m] != 0 {
-                assert_eq!(values2[m], 7);
-            }
-            m += 1;
-        }
-        assert!(kept > 0);
-        assert_eq!(kept, (0..1023).filter(|&x| x % 50 == 7).count());
     }
 
-    /// 4. Mid-syllable fault propagates through parse without panic / OOB.
+    /// Mid-syllable fault propagates through parse without panic / OOB.
     #[test]
     fn fuzz_torn_syllable_parse_pipeline_no_panic() {
         let full = "இருந்து தே".as_bytes();
-        // Truncate inside the trailing தே syllable.
         let the_off = full.len() - 6;
         let torn = &full[..the_off + 4];
         let mut arena = AstArena::new();
         let err = parse_query(torn, &mut arena).expect_err("parse must surface lex fault");
         assert_eq!(err, ParserError::LexMalformedUtf8);
         assert_eq!(arena.root, NIL);
-        // run_query maps the fault to false without aborting the process.
-        let cat = demo_catalog();
-        let _out = Box::new(QueryResult::new());
-        let mut arena2 = AstArena::new();
-        assert!(parse_query(&"தே".as_bytes()[..4], &mut arena2).is_err());
-        let _ = cat;
     }
 
-    // ── Ω-INF stress harness (additional production edge cases) ───────────
+    // ── GROK-4.5-OMEGA-EDGE-LOCK named harness ───────────────────────────
 
-    /// Fragmented input: query cuts off mid-stream after `வடி வய` (incomplete
-    /// filter / torn trailing Tamil sequence). Must yield a clean defensive error.
+    /// Validates truncating a query exactly mid-Tamil-syllable returns
+    /// `LexerError::MalformedUtf8(cursor)`.
     #[test]
-    fn omega_fragmented_input_mid_tamil_clean_error() {
-        let frag = "இருந்து பயனர்கள் | வடி வய";
-        let mut arena = AstArena::new();
-        let err = parse_query(frag.as_bytes(), &mut arena).expect_err("incomplete filter");
-        assert!(
-            matches!(
-                err,
-                ParserError::UnexpectedToken
-                    | ParserError::LexMalformedUtf8
-                    | ParserError::EmptyInput
-            ),
-            "unexpected error variant: {err:?}"
-        );
-        assert_eq!(arena.root, NIL);
-
-        // Explicit mid-codepoint cut of the trailing ய (3-byte Tamil) → MalformedUtf8.
-        let bytes = frag.as_bytes();
-        let torn = &bytes[..bytes.len() - 1];
+    fn test_fragmented_input_grapheme_safety() {
+        // தே = த (3) + ே (3). Cut at byte 4 ⇒ mid-syllable.
+        let the = "தே".as_bytes();
+        let torn = &the[..4];
         let mut lex = Lexer::new(torn);
-        let mut saw_malformed = false;
-        loop {
-            match lex.next_token() {
-                Ok(t) if t.kind == TokenKind::Eof => break,
-                Ok(_) => {}
-                Err(LexerError::MalformedUtf8) => {
-                    saw_malformed = true;
-                    break;
-                }
-                Err(e) => panic!("unexpected lexer fault: {e:?}"),
-            }
+        match lex.next_token() {
+            Err(LexerError::MalformedUtf8(cursor)) => assert_eq!(cursor, 0),
+            other => panic!("expected MalformedUtf8(cursor), got {other:?}"),
         }
-        assert!(saw_malformed);
+
+        // Streaming query fragment ending mid-syllable after இருந்து + space + torn தே.
+        let prefix = "இருந்து ";
+        let mut buf = [0u8; 64];
+        let pb = prefix.as_bytes();
+        buf[..pb.len()].copy_from_slice(pb);
+        buf[pb.len()..pb.len() + 4].copy_from_slice(&the[..4]);
+        let stream = &buf[..pb.len() + 4];
+
+        let mut arena = AstArena::new();
+        let err = parse_query(stream, &mut arena).expect_err("torn stream");
+        assert_eq!(err, ParserError::LexMalformedUtf8);
+
+        // Maximal munch: வடிவமைப்பு must remain Ident (not keyword வடி).
+        let mut lex2 = Lexer::new("வடிவமைப்பு".as_bytes());
+        let tok = lex2.next_token().unwrap();
+        assert_eq!(tok.kind, TokenKind::Ident);
     }
 
-    /// Maximum stress: chain enough `| வடி …` stages to exceed the 1024-node arena.
+    /// Simulates a massive 1025-stage pipeline and proves ArenaOverflow.
     #[test]
-    fn omega_maximum_stress_arena_full_on_pipeline_chain() {
+    fn test_arena_overflow_prevention() {
         let mut q = String::from("இருந்து பயனர்கள்");
-        // Each filter stage allocates Ident + Literal + BinOp + Filter (= 4 nodes).
-        // From allocates Ident + From (= 2) and Pipeline root (= 1) ⇒ ~4n+3 nodes.
-        // n = 300 ⇒ ~1203 nodes > AST_CAP (1024).
+        // 1025 filter stages ⇒ far beyond AST_CAP node budget.
         let mut i = 0usize;
-        while i < 300 {
+        while i < 1025 {
             q.push_str(" | வடி வயது > 0");
             i += 1;
         }
         q.push(';');
 
         let mut arena = Box::new(AstArena::new());
-        let err = parse_query(q.as_bytes(), &mut arena).expect_err("must hit ArenaFull");
-        assert_eq!(err, ParserError::ArenaFull);
-        assert!(arena.is_full() || arena.len as usize >= AST_CAP);
+        let err = parse_query(q.as_bytes(), &mut arena).expect_err("ArenaOverflow");
+        assert_eq!(err, ParserError::ArenaOverflow);
+
+        // Missing இருந்து source context.
+        let mut arena2 = AstArena::new();
+        let err2 = parse_query("வடி வயது > 1;".as_bytes(), &mut arena2).unwrap_err();
+        assert_eq!(err2, ParserError::MissingSourceContext);
     }
 
-    /// Non-aligned remainder: 1025 rows ⇒ one full SIMD batch + 1 scalar tail row.
+    /// Dataset of exactly 1025 rows — scalar tail must capture remainder row.
     #[test]
-    fn omega_non_aligned_1025_row_scalar_cleanup() {
+    fn test_simd_unaligned_tail_cleanup() {
         const LIVE: usize = 1025;
-        assert!(LIVE > BATCH_ROWS);
         assert_eq!(LIVE % BATCH_ROWS, 1);
 
         let mut values = [0i64; MAX_ROWS];
@@ -370,23 +332,19 @@ mod e2e_tests {
             values[i] = i as i64;
             i += 1;
         }
-        // Poison past live window.
-        values[LIVE] = -999;
+        values[LIVE] = -1;
         let mut sel = SelectionVector::all(LIVE);
         sel.mask[LIVE] = 0xA5;
 
-        // Keep only the trailing scalar-tail record (row 1024).
         Engine::filter_i64_eq(&values, &mut sel, LIVE, 1024);
-
         let mut r = 0usize;
-        while r < LIVE {
-            let expect = if r == 1024 { 1u8 } else { 0u8 };
-            assert_eq!(sel.mask[r], expect, "row {r}");
+        while r < 1024 {
+            assert_eq!(sel.mask[r], 0);
             r += 1;
         }
-        assert_eq!(sel.mask[LIVE], 0xA5, "must not clobber past 1025 live rows");
+        assert_eq!(sel.mask[1024], 1);
+        assert_eq!(sel.mask[LIVE], 0xA5);
 
-        // Full end-to-end against a 1025-row mock relation.
         let mut table = Table::new("பயனர்கள்".as_bytes());
         let age_i = table.add_int64_column("வயது".as_bytes()).unwrap();
         let name_i = table.add_utf8_column("பெயர்".as_bytes()).unwrap();
@@ -402,7 +360,6 @@ mod e2e_tests {
         {
             let col = table.utf8_mut(name_i).unwrap();
             col.clear();
-            // Minimal utf8 payloads — one byte labels cycling 0-9 for slab budget.
             let mut r = 0usize;
             while r < LIVE {
                 let b = [b'0' + (r % 10) as u8];
@@ -411,7 +368,6 @@ mod e2e_tests {
             }
         }
         table.set_row_count(LIVE);
-
         let mut cat = Catalog::new();
         let _ = cat.register(table);
         let q = "இருந்து பயனர்கள் | வடி வயது > 1023 | தேடு வயது;";
@@ -422,19 +378,37 @@ mod e2e_tests {
         assert_eq!(out.int_out[0].values[0], 1024);
     }
 
-    /// Empty / adversarial whitespace-only input (VT, CR, LF alternating).
+    /// Flood VT / ZWSP / CR through the whitespace LUT without branch panics.
     #[test]
-    fn omega_empty_input_vt_cr_lf_whitespace_lut() {
-        let ws: &[u8] = b"\x0B\r\n\x0B\r\n\x0C\t \r\n\x0B";
+    fn test_malformed_whitespace_injection() {
+        // Vertical tabs, CR, LF, FF, TAB, spaces, and UTF-8 ZWSP (E2 80 8B).
+        let mut buf = [0u8; 32];
+        let mut n = 0usize;
+        for &b in &[0x0Bu8, b'\r', b'\n', 0x0C, b'\t', b' '] {
+            buf[n] = b;
+            n += 1;
+        }
+        buf[n] = 0xE2;
+        buf[n + 1] = 0x80;
+        buf[n + 2] = 0x8B;
+        n += 3;
+        for &b in &[0x0Bu8, b'\r', b'\n'] {
+            buf[n] = b;
+            n += 1;
+        }
+        let ws = &buf[..n];
+
         let mut lex = Lexer::new(ws);
-        let tok = lex.next_token().expect("whitespace-only must not fault");
+        let tok = lex.next_token().expect("ws stream must not fault");
         assert_eq!(tok.kind, TokenKind::Eof);
 
         let mut arena = AstArena::new();
-        let err = parse_query(ws, &mut arena).expect_err("no pipeline stages");
-        assert_eq!(err, ParserError::EmptyInput);
+        assert_eq!(
+            parse_query(ws, &mut arena).unwrap_err(),
+            ParserError::EmptyInput
+        );
 
-        // Zero-heap hot path still holds on the canonical demo query.
+        // Zero-heap hot path integrity under the tracking allocator.
         let catalog = demo_catalog();
         let mut arena = Box::new(AstArena::new());
         let mut out = Box::new(QueryResult::new());

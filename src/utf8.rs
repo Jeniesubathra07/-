@@ -29,7 +29,7 @@ pub const UTF8_LEN_LUT: [u8; 256] = {
 
 /// True when the byte is an ASCII whitespace (branchless via LUT).
 /// Includes VT (`\x0B`) and FF (`\x0C`) for adversarial layout streams.
-pub const IS_WS_LUT: [u8; 256] = {
+pub const WHITESPACE_LUT: [u8; 256] = {
     let mut t = [0u8; 256];
     t[b' ' as usize] = 1;
     t[b'\t' as usize] = 1;
@@ -39,6 +39,9 @@ pub const IS_WS_LUT: [u8; 256] = {
     t[0x0C] = 1; // form feed
     t
 };
+
+/// Compatibility alias for older call sites.
+pub const IS_WS_LUT: [u8; 256] = WHITESPACE_LUT;
 
 /// True when the byte is an ASCII digit (branchless via LUT).
 pub const IS_DIGIT_LUT: [u8; 256] = {
@@ -201,7 +204,7 @@ pub fn scan_ident_end_checked(bytes: &[u8], start: usize) -> Result<usize, Utf8S
     let mut i = start;
     while i < bytes.len() {
         let b = bytes[i];
-        let stop = (IS_WS_LUT[b as usize] | IS_OP_LUT[b as usize]) != 0;
+        let stop = (WHITESPACE_LUT[b as usize] | IS_OP_LUT[b as usize]) != 0;
         if stop {
             break;
         }

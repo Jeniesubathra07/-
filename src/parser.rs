@@ -4,7 +4,7 @@
 //! `[AstNode; AST_CAP]` arena. Child linkages use `u32` indices only —
 //! never boxed pointer trees.
 //!
-//! Arena exhaustion returns [`ParserError::ArenaFull`] — never panics.
+//! Arena exhaustion returns [`ParserError::ArenaOverflow`] — never panics.
 
 use crate::lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
 
@@ -19,7 +19,7 @@ pub const NIL: u32 = u32::MAX;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ParserError {
     /// `[AstNode; 1024]` capacity exhausted.
-    ArenaFull = 0,
+    ArenaOverflow = 0,
     /// Unexpected / missing token in the pipeline grammar.
     UnexpectedToken = 1,
     /// Lexer reported malformed UTF-8 / torn Tamil syllable.
@@ -28,16 +28,20 @@ pub enum ParserError {
     LexTokenBufferFull = 3,
     /// Empty or non-pipeline input.
     EmptyInput = 4,
+    /// Pipeline stage appeared before an `இருந்து` (Irundu) source was registered.
+    MissingSourceContext = 5,
 }
 
-/// Compatibility alias used by older call sites / docs.
+/// Compatibility aliases.
 pub type ParseError = ParserError;
+/// Historical name retained for call-site clarity.
+pub const ARENA_FULL: ParserError = ParserError::ArenaOverflow;
 
 impl ParserError {
     #[inline(always)]
     pub fn from_lexer(err: LexerError) -> Self {
         match err {
-            LexerError::MalformedUtf8 => ParserError::LexMalformedUtf8,
+            LexerError::MalformedUtf8(_) => ParserError::LexMalformedUtf8,
             LexerError::TokenBufferFull => ParserError::LexTokenBufferFull,
         }
     }
@@ -135,12 +139,12 @@ impl AstArena {
         }
     }
 
-    /// Allocate a node. Returns [`ParserError::ArenaFull`] at capacity — no OOB.
+    /// Allocate a node. Returns [`ParserError::ArenaOverflow`] at capacity — no OOB.
     #[inline(always)]
     pub fn try_alloc(&mut self, node: AstNode) -> Result<u32, ParserError> {
         let i = self.len as usize;
         if i >= AST_CAP {
-            return Err(ParserError::ArenaFull);
+            return Err(ParserError::ArenaOverflow);
         }
         self.nodes[i] = node;
         self.len = self.len.wrapping_add(1);
@@ -506,8 +510,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a full pipeline into `arena`. Returns the root node index or a
-    /// defensive [`ParserError`] (including arena overflow).
+    /// defensive [`ParserError`] (including arena overflow / missing source).
+    #[inline(always)]
     pub fn parse_pipeline(&mut self, arena: &mut AstArena) -> Result<u32, ParserError> {
+        // Mandate B: first stage MUST be இருந்து (Irundu) source registration.
+        match self.peek().kind {
+            TokenKind::Irundu => {}
+            TokenKind::Eof => return Err(ParserError::EmptyInput),
+            _ => return Err(ParserError::MissingSourceContext),
+        }
         let first = self.parse_stage(arena)?;
         let root = arena.try_alloc(AstNode {
             kind: NodeKind::Pipeline,
@@ -525,6 +536,10 @@ impl<'a> Parser<'a> {
             let kind = self.peek().kind;
             if kind == TokenKind::Pipe {
                 self.bump();
+                let next_kind = self.peek().kind;
+                if next_kind == TokenKind::Eof {
+                    return Err(ParserError::UnexpectedToken);
+                }
                 let stage = self.parse_stage(arena)?;
                 if let Some(node) = arena.get_mut(prev) {
                     node.next = stage;
@@ -591,8 +606,16 @@ mod tests {
         // Saturate the flat structural boundary before parsing.
         arena.len = AST_CAP as u32;
         let err = parse_query(q.as_bytes(), &mut arena).expect_err("must overflow");
-        assert_eq!(err, ParserError::ArenaFull);
+        assert_eq!(err, ParserError::ArenaOverflow);
         // No panic / no OOB — len stays at capacity.
         assert!(arena.is_full());
+    }
+
+    #[test]
+    fn missing_source_context_without_irundu() {
+        let q = "வடி வயது > 21 | எடு 10;";
+        let mut arena = AstArena::new();
+        let err = parse_query(q.as_bytes(), &mut arena).expect_err("need source");
+        assert_eq!(err, ParserError::MissingSourceContext);
     }
 }
