@@ -3,14 +3,27 @@
 //! Scans left-to-right over `&[u8]` with zero heap traffic. Keywords are
 //! matched by raw byte equality against compile-time UTF-8 constants.
 //! Numbers are accumulated in a branchless register loop.
+//!
+//! Torn Tamil syllables and truncated UTF-8 sequences surface as
+//! [`LexerError::MalformedUtf8`] — never as panics.
 
 use crate::utf8::{
-    extend_grapheme_cluster, next_char_boundary, scan_ident_end, str_from_parent, IS_DIGIT_LUT,
-    IS_OP_LUT, IS_WS_LUT,
+    checked_char_end, scan_ident_end_checked, str_from_parent, IS_DIGIT_LUT, IS_OP_LUT, IS_WS_LUT,
+    Utf8ScanStatus,
 };
 
 /// Maximum tokens emitted into the fixed token buffer by a single scan.
 pub const MAX_TOKENS: usize = 256;
+
+/// Defensive lexer failure modes (no panics on adversarial input).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum LexerError {
+    /// Buffer ends mid-codepoint or mid-Tamil-syllable (e.g. truncated `தே`).
+    MalformedUtf8 = 0,
+    /// Fixed token window exhausted.
+    TokenBufferFull = 1,
+}
 
 /// Keyword / operator / literal classification. Packed as `u8` for cache density.
 #[repr(u8)]
@@ -89,6 +102,17 @@ impl Token {
     }
 
     #[inline(always)]
+    pub const fn error(start: u32, end: u32) -> Self {
+        Self {
+            kind: TokenKind::Error,
+            _pad: [0; 3],
+            start,
+            end,
+            number: 0,
+        }
+    }
+
+    #[inline(always)]
     pub fn text<'a>(&self, src: &'a [u8]) -> Option<&'a str> {
         str_from_parent(src, self.start as usize, self.end as usize)
     }
@@ -120,19 +144,16 @@ const OP_KIND_LUT: [u8; 256] = {
 
 #[inline(always)]
 fn match_keyword(slice: &[u8]) -> TokenKind {
-    // Length-bucketed exact compares — no heap, no dynamic dispatch.
     match slice.len() {
         9 => {
-            if slice == KW_VADI || slice == KW_KANI || slice == KW_EDU || slice == KW_INAI {
-                if slice == KW_VADI {
-                    TokenKind::Vadi
-                } else if slice == KW_KANI {
-                    TokenKind::Kani
-                } else if slice == KW_EDU {
-                    TokenKind::Edu
-                } else {
-                    TokenKind::Inai
-                }
+            if slice == KW_VADI {
+                TokenKind::Vadi
+            } else if slice == KW_KANI {
+                TokenKind::Kani
+            } else if slice == KW_EDU {
+                TokenKind::Edu
+            } else if slice == KW_INAI {
+                TokenKind::Inai
             } else {
                 TokenKind::Ident
             }
@@ -168,17 +189,31 @@ fn match_keyword(slice: &[u8]) -> TokenKind {
     }
 }
 
+#[inline(always)]
+fn map_utf8_err(status: Utf8ScanStatus) -> LexerError {
+    match status {
+        Utf8ScanStatus::Malformed => LexerError::MalformedUtf8,
+        Utf8ScanStatus::Ok => LexerError::MalformedUtf8,
+    }
+}
+
 /// Zero-allocation streaming lexer over a borrowed byte buffer.
 #[repr(C)]
 pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
+    /// Sticky error latched on first malformation (Iterator path).
+    fault: Option<LexerError>,
 }
 
 impl<'a> Lexer<'a> {
     #[inline(always)]
     pub const fn new(src: &'a [u8]) -> Self {
-        Self { src, pos: 0 }
+        Self {
+            src,
+            pos: 0,
+            fault: None,
+        }
     }
 
     #[inline(always)]
@@ -192,12 +227,16 @@ impl<'a> Lexer<'a> {
     }
 
     #[inline(always)]
+    pub const fn last_error(&self) -> Option<LexerError> {
+        self.fault
+    }
+
+    #[inline(always)]
     fn skip_ws(&mut self) {
         let bytes = self.src;
         let mut i = self.pos;
         while i < bytes.len() {
             let is_ws = IS_WS_LUT[bytes[i] as usize];
-            // branchless-ish early exit via mask; still need loop bound check
             if is_ws == 0 {
                 break;
             }
@@ -219,7 +258,6 @@ impl<'a> Lexer<'a> {
             if is_digit == 0 {
                 break;
             }
-            // Hot register loop — no branches on digit value itself.
             val = val
                 .wrapping_mul(10)
                 .wrapping_add((b.wrapping_sub(b'0')) as i64);
@@ -241,8 +279,15 @@ impl<'a> Lexer<'a> {
         let b = self.src[self.pos];
         let kind_u8 = OP_KIND_LUT[b as usize];
         self.pos += 1;
-        // SAFETY-equivalent: LUT only maps known ops; Error reserved for misuse.
-        let kind = unsafe { core::mem::transmute::<u8, TokenKind>(kind_u8) };
+        let kind = match kind_u8 {
+            x if x == TokenKind::Pipe as u8 => TokenKind::Pipe,
+            x if x == TokenKind::Eq as u8 => TokenKind::Eq,
+            x if x == TokenKind::Gt as u8 => TokenKind::Gt,
+            x if x == TokenKind::Lt as u8 => TokenKind::Lt,
+            x if x == TokenKind::Comma as u8 => TokenKind::Comma,
+            x if x == TokenKind::Semi as u8 => TokenKind::Semi,
+            _ => TokenKind::Error,
+        };
         Token {
             kind,
             _pad: [0; 3],
@@ -253,61 +298,37 @@ impl<'a> Lexer<'a> {
     }
 
     #[inline(always)]
-    fn scan_ident_or_keyword(&mut self) -> Token {
+    fn scan_ident_or_keyword(&mut self) -> Result<Token, LexerError> {
         let start = self.pos;
-        let end = scan_ident_end(self.src, start);
-        // Ensure we never tear a Tamil grapheme if scan stopped mid-cluster
-        // (operators/ws always sit on boundaries, so this is a safety net).
-        let end = {
-            let nb = next_char_boundary(self.src, start);
-            let _ = extend_grapheme_cluster(self.src, nb);
-            end
-        };
+        // Reject truncated lead before scanning.
+        let _ = checked_char_end(self.src, start).map_err(map_utf8_err)?;
+        let end = scan_ident_end_checked(self.src, start).map_err(map_utf8_err)?;
         self.pos = end;
         let slice = &self.src[start..end];
+        // Final UTF-8 validation pins grapheme-safe `&str` lifetime to parent.
+        if core::str::from_utf8(slice).is_err() {
+            self.fault = Some(LexerError::MalformedUtf8);
+            return Err(LexerError::MalformedUtf8);
+        }
         let kind = match_keyword(slice);
-        Token {
+        Ok(Token {
             kind,
             _pad: [0; 3],
             start: start as u32,
             end: end as u32,
             number: 0,
-        }
+        })
     }
 
-    /// Fill a caller-provided fixed token buffer. Returns the number of tokens
-    /// written (excluding a trailing EOF which is always appended if capacity remains).
-    pub fn tokenize_into(&mut self, out: &mut [Token; MAX_TOKENS]) -> usize {
-        let mut n = 0usize;
-        while n + 1 < MAX_TOKENS {
-            match self.next() {
-                Some(tok) => {
-                    let is_eof = tok.kind as u8 == TokenKind::Eof as u8;
-                    out[n] = tok;
-                    n += 1;
-                    if is_eof {
-                        break;
-                    }
-                }
-                None => {
-                    out[n] = Token::eof();
-                    n += 1;
-                    break;
-                }
-            }
-        }
-        n
-    }
-}
-
-impl<'a> Iterator for Lexer<'a> {
-    type Item = Token;
-
+    /// Primary fallible scan step — never panics on torn syllables.
     #[inline(always)]
-    fn next(&mut self) -> Option<Self::Item> {
+    pub fn next_token(&mut self) -> Result<Token, LexerError> {
+        if let Some(err) = self.fault {
+            return Err(err);
+        }
         self.skip_ws();
         if self.pos >= self.src.len() {
-            return Some(Token {
+            return Ok(Token {
                 kind: TokenKind::Eof,
                 _pad: [0; 3],
                 start: self.pos as u32,
@@ -318,14 +339,64 @@ impl<'a> Iterator for Lexer<'a> {
         let b = self.src[self.pos];
         let is_digit = IS_DIGIT_LUT[b as usize];
         let is_op = IS_OP_LUT[b as usize];
-        // Dispatch by class masks — hot path stays linear.
         if is_digit != 0 {
-            return Some(self.scan_number());
+            return Ok(self.scan_number());
         }
         if is_op != 0 {
-            return Some(self.scan_operator());
+            return Ok(self.scan_operator());
         }
-        Some(self.scan_ident_or_keyword())
+        // Non-ASCII / ident path: validate UTF-8 completeness first.
+        match checked_char_end(self.src, self.pos) {
+            Ok(_) => {}
+            Err(status) => {
+                let err = map_utf8_err(status);
+                self.fault = Some(err);
+                return Err(err);
+            }
+        }
+        match self.scan_ident_or_keyword() {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                self.fault = Some(e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Fill a caller-provided fixed token buffer.
+    pub fn tokenize_into(&mut self, out: &mut [Token; MAX_TOKENS]) -> Result<usize, LexerError> {
+        let mut n = 0usize;
+        while n + 1 < MAX_TOKENS {
+            match self.next_token()? {
+                tok => {
+                    let is_eof = tok.kind as u8 == TokenKind::Eof as u8;
+                    out[n] = tok;
+                    n += 1;
+                    if is_eof {
+                        return Ok(n);
+                    }
+                }
+            }
+        }
+        Err(LexerError::TokenBufferFull)
+    }
+}
+
+impl<'a> Iterator for Lexer<'a> {
+    type Item = Token;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_token() {
+            Ok(tok) => Some(tok),
+            Err(err) => {
+                let start = self.pos as u32;
+                self.fault = Some(err);
+                // Advance one byte to avoid infinite Error loops on Iterator consumers.
+                self.pos = self.pos.saturating_add(1).min(self.src.len());
+                Some(Token::error(start, self.pos as u32))
+            }
+        }
     }
 }
 
@@ -338,14 +409,13 @@ mod tests {
         let q = "இருந்து பயனர்கள் | வடி வயது > 21 | அடுக்கு வயது | எடு 10 | தேடு பெயர், வயது;";
         let mut lex = Lexer::new(q.as_bytes());
         let mut buf = [Token::eof(); MAX_TOKENS];
-        let n = lex.tokenize_into(&mut buf);
+        let n = lex.tokenize_into(&mut buf).expect("tokenize");
         assert!(n > 10);
         assert_eq!(buf[0].kind, TokenKind::Irundu);
         assert_eq!(buf[1].kind, TokenKind::Ident);
         assert_eq!(buf[1].text(q.as_bytes()), Some("பயனர்கள்"));
         assert_eq!(buf[2].kind, TokenKind::Pipe);
         assert_eq!(buf[3].kind, TokenKind::Vadi);
-        // Ensure தேடு keeps vowel marker attached
         let thedu = buf.iter().find(|t| t.kind == TokenKind::Thedu).unwrap();
         assert_eq!(thedu.text(q.as_bytes()), Some("தேடு"));
         let pe = buf
@@ -353,5 +423,16 @@ mod tests {
             .find(|t| t.kind == TokenKind::Ident && t.text(q.as_bytes()) == Some("பெயர்"))
             .unwrap();
         assert_eq!(pe.text(q.as_bytes()), Some("பெயர்"));
+    }
+
+    #[test]
+    fn mid_syllable_the_cut_returns_malformed_utf8() {
+        // தே = த (E0 AE A4) + ே (E0 AF 87). Cut after 4 bytes ⇒ mid-syllable.
+        let full = "தே".as_bytes();
+        assert_eq!(full.len(), 6);
+        let truncated = &full[..4];
+        let mut lex = Lexer::new(truncated);
+        let err = lex.next_token().expect_err("must reject torn தே");
+        assert_eq!(err, LexerError::MalformedUtf8);
     }
 }

@@ -3,6 +3,10 @@
 //! Walks the parser's flat index arena and evaluates operators over columnar
 //! batches of [`BATCH_ROWS`] rows using explicit loop unrolling and byte-mask
 //! selection vectors (hardware-friendly, allocation-free in the hot path).
+//!
+//! When `rows` is not a multiple of [`BATCH_ROWS`] (or of the 8-wide unroll),
+//! a scalar residue tail loop finishes remaining records without reading past
+//! the live row window — preventing SIMD vector tail corruption.
 
 use crate::lexer::TokenKind;
 use crate::parser::{AstArena, AstNode, NodeKind, NIL};
@@ -13,6 +17,9 @@ use crate::storage::{
 
 /// Maximum projected output columns.
 pub const MAX_PROJECT: usize = 8;
+
+/// Width of the inner unrolled compare lane group.
+pub const UNROLL: usize = 8;
 
 /// Result of executing a pipeline: columnar projection over selected rows.
 #[repr(C)]
@@ -70,6 +77,111 @@ impl Default for QueryResult {
     }
 }
 
+/// Compare predicate used by the vectorized filter kernels.
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum CmpOp {
+    Gt = 0,
+    Lt = 1,
+    Eq = 2,
+}
+
+#[inline(always)]
+fn cmp_i64(op: CmpOp, v: i64, lit: i64) -> u8 {
+    match op {
+        CmpOp::Gt => (v > lit) as u8,
+        CmpOp::Lt => (v < lit) as u8,
+        CmpOp::Eq => (v == lit) as u8,
+    }
+}
+
+/// Apply an 8-wide unrolled compare lane group at `base + j..+7`.
+#[inline(always)]
+unsafe fn apply_unroll8(
+    values: &[i64; MAX_ROWS],
+    sel: &mut SelectionVector,
+    base: usize,
+    j: usize,
+    lit: i64,
+    op: CmpOp,
+) {
+    let i0 = base + j;
+    let i1 = i0 + 1;
+    let i2 = i0 + 2;
+    let i3 = i0 + 3;
+    let i4 = i0 + 4;
+    let i5 = i0 + 5;
+    let i6 = i0 + 6;
+    let i7 = i0 + 7;
+    // Caller guarantees i7 < live row count.
+    let p0 = cmp_i64(op, values[i0], lit);
+    let p1 = cmp_i64(op, values[i1], lit);
+    let p2 = cmp_i64(op, values[i2], lit);
+    let p3 = cmp_i64(op, values[i3], lit);
+    let p4 = cmp_i64(op, values[i4], lit);
+    let p5 = cmp_i64(op, values[i5], lit);
+    let p6 = cmp_i64(op, values[i6], lit);
+    let p7 = cmp_i64(op, values[i7], lit);
+    sel.mask[i0] &= p0;
+    sel.mask[i1] &= p1;
+    sel.mask[i2] &= p2;
+    sel.mask[i3] &= p3;
+    sel.mask[i4] &= p4;
+    sel.mask[i5] &= p5;
+    sel.mask[i6] &= p6;
+    sel.mask[i7] &= p7;
+}
+
+/// Vectorized filter with full-batch, 8-wide partial, and scalar residue phases.
+///
+/// Phase A: complete `BATCH_ROWS` (1024) chunks.
+/// Phase B: 8-wide unroll over the aligned portion of the leftover chunk.
+/// Phase C: scalar residue for `n % 8` tail rows — never reads past `n`.
+#[inline(always)]
+fn filter_i64_chunked(
+    values: &[i64; MAX_ROWS],
+    sel: &mut SelectionVector,
+    rows: usize,
+    lit: i64,
+    op: CmpOp,
+) {
+    let n = rows.min(sel.len as usize).min(MAX_ROWS);
+    let mut i = 0usize;
+
+    // Phase A — full 1024-row batches.
+    while i + BATCH_ROWS <= n {
+        let base = i;
+        let mut j = 0usize;
+        while j < BATCH_ROWS {
+            // SAFETY: base+j+7 < base+BATCH_ROWS <= n <= MAX_ROWS.
+            unsafe {
+                apply_unroll8(values, sel, base, j, lit, op);
+            }
+            j += UNROLL;
+        }
+        i += BATCH_ROWS;
+    }
+
+    // Phase B — 8-wide aligned portion of the leftover (< BATCH_ROWS) chunk.
+    let rem = n - i;
+    let aligned = rem & !(UNROLL - 1);
+    let mut j = 0usize;
+    while j < aligned {
+        unsafe {
+            apply_unroll8(values, sel, i, j, lit, op);
+        }
+        j += UNROLL;
+    }
+    i += aligned;
+
+    // Phase C — scalar residue tail (0..7 rows). Bounds-checked; no SIMD overrun.
+    while i < n {
+        let p = cmp_i64(op, values[i], lit);
+        sel.mask[i] &= p;
+        i += 1;
+    }
+}
+
 /// Execution context: catalog + source bytes for identifier resolution.
 #[repr(C)]
 pub struct Engine<'a> {
@@ -94,8 +206,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Vectorized Int64 compare into a selection mask over `rows` elements.
-    /// Processes in chunks of 1024 with explicit 8-wide unroll inside.
+    /// Vectorized Int64 `>` into a selection mask over `rows` elements.
     #[inline(always)]
     pub fn filter_i64_gt(
         values: &[i64; MAX_ROWS],
@@ -103,58 +214,10 @@ impl<'a> Engine<'a> {
         rows: usize,
         lit: i64,
     ) {
-        let n = rows.min(sel.len as usize).min(MAX_ROWS);
-        let mut i = 0usize;
-        // Chunk by BATCH_ROWS
-        while i + BATCH_ROWS <= n {
-            let base = i;
-            let mut j = 0usize;
-            while j < BATCH_ROWS {
-                // 8-wide unroll
-                let j0 = j;
-                let j1 = j + 1;
-                let j2 = j + 2;
-                let j3 = j + 3;
-                let j4 = j + 4;
-                let j5 = j + 5;
-                let j6 = j + 6;
-                let j7 = j + 7;
-                let m0 = sel.mask[base + j0];
-                let m1 = sel.mask[base + j1];
-                let m2 = sel.mask[base + j2];
-                let m3 = sel.mask[base + j3];
-                let m4 = sel.mask[base + j4];
-                let m5 = sel.mask[base + j5];
-                let m6 = sel.mask[base + j6];
-                let m7 = sel.mask[base + j7];
-                // Branchless predicate: (v > lit) as u8
-                let p0 = (values[base + j0] > lit) as u8;
-                let p1 = (values[base + j1] > lit) as u8;
-                let p2 = (values[base + j2] > lit) as u8;
-                let p3 = (values[base + j3] > lit) as u8;
-                let p4 = (values[base + j4] > lit) as u8;
-                let p5 = (values[base + j5] > lit) as u8;
-                let p6 = (values[base + j6] > lit) as u8;
-                let p7 = (values[base + j7] > lit) as u8;
-                sel.mask[base + j0] = m0 & p0;
-                sel.mask[base + j1] = m1 & p1;
-                sel.mask[base + j2] = m2 & p2;
-                sel.mask[base + j3] = m3 & p3;
-                sel.mask[base + j4] = m4 & p4;
-                sel.mask[base + j5] = m5 & p5;
-                sel.mask[base + j6] = m6 & p6;
-                sel.mask[base + j7] = m7 & p7;
-                j += 8;
-            }
-            i += BATCH_ROWS;
-        }
-        while i < n {
-            let p = (values[i] > lit) as u8;
-            sel.mask[i] &= p;
-            i += 1;
-        }
+        filter_i64_chunked(values, sel, rows, lit, CmpOp::Gt);
     }
 
+    /// Vectorized Int64 `<` with the same chunk / residue contract as `gt`.
     #[inline(always)]
     pub fn filter_i64_lt(
         values: &[i64; MAX_ROWS],
@@ -162,15 +225,10 @@ impl<'a> Engine<'a> {
         rows: usize,
         lit: i64,
     ) {
-        let n = rows.min(sel.len as usize).min(MAX_ROWS);
-        let mut i = 0usize;
-        while i < n {
-            let p = (values[i] < lit) as u8;
-            sel.mask[i] &= p;
-            i += 1;
-        }
+        filter_i64_chunked(values, sel, rows, lit, CmpOp::Lt);
     }
 
+    /// Vectorized Int64 `=` with the same chunk / residue contract as `gt`.
     #[inline(always)]
     pub fn filter_i64_eq(
         values: &[i64; MAX_ROWS],
@@ -178,13 +236,7 @@ impl<'a> Engine<'a> {
         rows: usize,
         lit: i64,
     ) {
-        let n = rows.min(sel.len as usize).min(MAX_ROWS);
-        let mut i = 0usize;
-        while i < n {
-            let p = (values[i] == lit) as u8;
-            sel.mask[i] &= p;
-            i += 1;
-        }
+        filter_i64_chunked(values, sel, rows, lit, CmpOp::Eq);
     }
 
     /// Stable argsort of selected Int64 keys into `order` (row indices).
@@ -202,12 +254,10 @@ impl<'a> Engine<'a> {
         let mut i = 0usize;
         while i < n {
             let take = sel.mask[i];
-            // Branchless append when selected
             order[*order_len] = i as u16;
             *order_len += take as usize;
             i += 1;
         }
-        // Insertion sort on the compacted index list
         let mut a = 1usize;
         while a < *order_len {
             let key_idx = order[a];
@@ -287,7 +337,6 @@ impl<'a> Engine<'a> {
         order_len: usize,
         out: &mut QueryResult,
     ) -> bool {
-        // Collect projected column names from ColumnList chain.
         let mut col_ids = [usize::MAX; MAX_PROJECT];
         let mut nproj = 0usize;
         let mut cur = project.left;
@@ -311,7 +360,6 @@ impl<'a> Engine<'a> {
         }
         out.col_count = nproj as u16;
 
-        // Reset output slabs (no heap — reuse inline buffers).
         let mut c0 = 0usize;
         while c0 < nproj {
             out.utf8_out[c0].clear();
@@ -322,6 +370,10 @@ impl<'a> Engine<'a> {
         let mut oi = 0usize;
         while oi < order_len && out_row < MAX_ROWS {
             let src_row = order[oi] as usize;
+            if src_row >= table.row_count as usize {
+                oi += 1;
+                continue;
+            }
             let mut c = 0usize;
             while c < nproj {
                 let cid = col_ids[c];
@@ -381,9 +433,8 @@ impl<'a> Engine<'a> {
                         Some(t) => t,
                         None => return false,
                     };
-                    active_rows = table.row_count as usize;
+                    active_rows = (table.row_count as usize).min(MAX_ROWS);
                     sel = SelectionVector::all(active_rows);
-                    // Compact identity order
                     order_len = active_rows;
                     let mut i = 0usize;
                     while i < active_rows {
@@ -405,7 +456,6 @@ impl<'a> Engine<'a> {
                     if !self.apply_filter(table, bin, arena, &mut sel) {
                         return false;
                     }
-                    // Rebuild order from selection if not yet custom-sorted
                     if !sorted {
                         order_len = 0;
                         let mut i = 0usize;
@@ -415,12 +465,11 @@ impl<'a> Engine<'a> {
                             i += 1;
                         }
                     } else {
-                        // Filter existing order list
                         let mut w = 0usize;
                         let mut r = 0usize;
                         while r < order_len {
                             let idx = order[r] as usize;
-                            let keep = sel.mask[idx];
+                            let keep = if idx < active_rows { sel.mask[idx] } else { 0 };
                             order[w] = order[r];
                             w += keep as usize;
                             r += 1;
@@ -468,10 +517,7 @@ impl<'a> Engine<'a> {
                         return false;
                     }
                 }
-                NodeKind::Derive | NodeKind::Group | NodeKind::Aggregate | NodeKind::Join => {
-                    // Supported in AST; demo pipeline does not exercise these stages.
-                    // Keep as recognized no-op extension points without heap traffic.
-                }
+                NodeKind::Derive | NodeKind::Group | NodeKind::Aggregate | NodeKind::Join => {}
                 _ => return false,
             }
             stage_id = stage.next;
@@ -493,8 +539,8 @@ pub fn run_query(src: &str, catalog: &Catalog, arena: &mut AstArena, out: &mut Q
     arena.len = 0;
     arena.root = NIL;
     let root = match crate::parser::parse_query(src.as_bytes(), arena) {
-        Some(r) => r,
-        None => return false,
+        Ok(r) => r,
+        Err(_) => return false,
     };
     debug_assert_eq!(arena.root, root);
     let engine = Engine::new(catalog, src.as_bytes());
@@ -515,7 +561,6 @@ mod tests {
         assert!(run_query(q, &cat, &mut arena, &mut out));
         assert_eq!(out.col_count, 2);
         assert_eq!(out.row_count, 10);
-        // Ages must be sorted ascending and all > 21
         let mut prev = i64::MIN;
         let mut i = 0u16;
         while i < out.row_count {
@@ -525,7 +570,33 @@ mod tests {
             prev = age;
             i += 1;
         }
-        // First projected column is பெயர் (utf8), non-empty
         assert!(out.utf8_out[0].get_row(0).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn chunk_tail_scalar_residue_non_multiple_of_batch() {
+        // 15 rows: not divisible by BATCH_ROWS (1024) nor by UNROLL (8).
+        // Residue path must keep indices 8..14 without corrupting mask[15..].
+        let mut values = [0i64; MAX_ROWS];
+        let mut r = 0usize;
+        while r < 15 {
+            values[r] = r as i64;
+            r += 1;
+        }
+        // Poison beyond the live window — scalar/SIMD must not clear these via overrun.
+        values[15] = 999;
+        let mut sel = SelectionVector::all(15);
+        sel.mask[15] = 0xAB; // sentinel outside live window
+        Engine::filter_i64_gt(&values, &mut sel, 15, 7);
+        let mut i = 0usize;
+        while i < 8 {
+            assert_eq!(sel.mask[i], 0, "row {i} must be dropped");
+            i += 1;
+        }
+        while i < 15 {
+            assert_eq!(sel.mask[i], 1, "row {i} must be kept");
+            i += 1;
+        }
+        assert_eq!(sel.mask[15], 0xAB, "must not clobber past live row count");
     }
 }

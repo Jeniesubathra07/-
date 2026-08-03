@@ -3,14 +3,42 @@
 //! Consumes lexer tokens linearly and stores tree relationships in a flat
 //! `[AstNode; AST_CAP]` arena. Child linkages use `u32` indices only —
 //! never boxed pointer trees.
+//!
+//! Arena exhaustion returns [`ParseError::ArenaOverflow`] — never panics.
 
-use crate::lexer::{Lexer, Token, TokenKind, MAX_TOKENS};
+use crate::lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
 
 /// Fixed arena capacity (power-of-two friendly, fits L2 comfortably).
 pub const AST_CAP: usize = 1024;
 
 /// Sentinel index meaning "no child / no node".
 pub const NIL: u32 = u32::MAX;
+
+/// Defensive parse failure modes.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ParseError {
+    /// `[AstNode; 1024]` capacity exhausted.
+    ArenaOverflow = 0,
+    /// Unexpected / missing token in the pipeline grammar.
+    UnexpectedToken = 1,
+    /// Lexer reported malformed UTF-8 / torn Tamil syllable.
+    LexMalformedUtf8 = 2,
+    /// Lexer token window overflow.
+    LexTokenBufferFull = 3,
+    /// Empty or non-pipeline input.
+    EmptyInput = 4,
+}
+
+impl ParseError {
+    #[inline(always)]
+    pub fn from_lexer(err: LexerError) -> Self {
+        match err {
+            LexerError::MalformedUtf8 => ParseError::LexMalformedUtf8,
+            LexerError::TokenBufferFull => ParseError::LexTokenBufferFull,
+        }
+    }
+}
 
 /// AST node discriminant. Packed `u8` for cache-line density.
 #[repr(u8)]
@@ -104,15 +132,21 @@ impl AstArena {
         }
     }
 
+    /// Allocate a node. Returns [`ParseError::ArenaOverflow`] at capacity — no OOB.
     #[inline(always)]
-    pub fn alloc(&mut self, node: AstNode) -> Option<u32> {
+    pub fn try_alloc(&mut self, node: AstNode) -> Result<u32, ParseError> {
         let i = self.len as usize;
         if i >= AST_CAP {
-            return None;
+            return Err(ParseError::ArenaOverflow);
         }
         self.nodes[i] = node;
         self.len = self.len.wrapping_add(1);
-        Some(i as u32)
+        Ok(i as u32)
+    }
+
+    #[inline(always)]
+    pub fn alloc(&mut self, node: AstNode) -> Option<u32> {
+        self.try_alloc(node).ok()
     }
 
     #[inline(always)]
@@ -136,6 +170,11 @@ impl AstArena {
             None
         }
     }
+
+    #[inline(always)]
+    pub fn is_full(&self) -> bool {
+        (self.len as usize) >= AST_CAP
+    }
 }
 
 /// Linear recursive-descent-free parser over a fixed token window.
@@ -148,15 +187,28 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub fn from_source(src: &'a [u8]) -> Self {
+    pub fn try_from_source(src: &'a [u8]) -> Result<Self, ParseError> {
         let mut lexer = Lexer::new(src);
         let mut tokens = [Token::eof(); MAX_TOKENS];
-        let tok_len = lexer.tokenize_into(&mut tokens);
-        Self {
+        let tok_len = lexer.tokenize_into(&mut tokens).map_err(ParseError::from_lexer)?;
+        Ok(Self {
             src,
             tokens,
             tok_len,
             cursor: 0,
+        })
+    }
+
+    /// Backward-compatible constructor; empty token stream on lex failure.
+    pub fn from_source(src: &'a [u8]) -> Self {
+        match Self::try_from_source(src) {
+            Ok(p) => p,
+            Err(_) => Self {
+                src,
+                tokens: [Token::eof(); MAX_TOKENS],
+                tok_len: 1,
+                cursor: 0,
+            },
         }
     }
 
@@ -178,18 +230,18 @@ impl<'a> Parser<'a> {
     }
 
     #[inline(always)]
-    fn expect(&mut self, kind: TokenKind) -> Option<Token> {
+    fn expect(&mut self, kind: TokenKind) -> Result<Token, ParseError> {
         let t = self.peek();
         if t.kind as u8 == kind as u8 {
-            Some(self.bump())
+            Ok(self.bump())
         } else {
-            None
+            Err(ParseError::UnexpectedToken)
         }
     }
 
     #[inline(always)]
-    fn alloc_ident(&mut self, arena: &mut AstArena, tok: Token) -> Option<u32> {
-        arena.alloc(AstNode {
+    fn alloc_ident(&mut self, arena: &mut AstArena, tok: Token) -> Result<u32, ParseError> {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Ident,
             op: TokenKind::Ident,
             _pad: [0; 2],
@@ -203,8 +255,8 @@ impl<'a> Parser<'a> {
     }
 
     #[inline(always)]
-    fn alloc_literal(&mut self, arena: &mut AstArena, tok: Token) -> Option<u32> {
-        arena.alloc(AstNode {
+    fn alloc_literal(&mut self, arena: &mut AstArena, tok: Token) -> Result<u32, ParseError> {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Literal,
             op: TokenKind::Number,
             _pad: [0; 2],
@@ -217,7 +269,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_column_list(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_column_list(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         let first_tok = self.expect(TokenKind::Ident)?;
         let head = self.alloc_ident(arena, first_tok)?;
         let mut tail = head;
@@ -231,17 +283,15 @@ impl<'a> Parser<'a> {
             if let Some(node) = arena.get_mut(tail) {
                 node.next = id;
             }
-            // Wrap as ColumnList chain: each Ident.next links siblings.
             tail = id;
         }
-        // Tag head as ColumnList for clearer runtime walk.
         if let Some(node) = arena.get_mut(head) {
             node.kind = NodeKind::ColumnList;
         }
-        Some(head)
+        Ok(head)
     }
 
-    fn parse_filter(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_filter(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         self.expect(TokenKind::Vadi)?;
         let col_tok = self.expect(TokenKind::Ident)?;
         let col = self.alloc_ident(arena, col_tok)?;
@@ -251,11 +301,11 @@ impl<'a> Parser<'a> {
             TokenKind::Gt | TokenKind::Lt | TokenKind::Eq
         );
         if !op_ok {
-            return None;
+            return Err(ParseError::UnexpectedToken);
         }
         let lit_tok = self.expect(TokenKind::Number)?;
         let lit = self.alloc_literal(arena, lit_tok)?;
-        let bin = arena.alloc(AstNode {
+        let bin = arena.try_alloc(AstNode {
             kind: NodeKind::BinOp,
             op: op_tok.kind,
             _pad: [0; 2],
@@ -266,7 +316,7 @@ impl<'a> Parser<'a> {
             right: lit,
             next: NIL,
         })?;
-        arena.alloc(AstNode {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Filter,
             op: TokenKind::Vadi,
             _pad: [0; 2],
@@ -279,11 +329,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_sort(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_sort(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         self.expect(TokenKind::Adukku)?;
         let col_tok = self.expect(TokenKind::Ident)?;
         let col = self.alloc_ident(arena, col_tok)?;
-        arena.alloc(AstNode {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Sort,
             op: TokenKind::Adukku,
             _pad: [0; 2],
@@ -296,10 +346,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_take(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_take(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         self.expect(TokenKind::Edu)?;
         let n_tok = self.expect(TokenKind::Number)?;
-        arena.alloc(AstNode {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Take,
             op: TokenKind::Edu,
             _pad: [0; 2],
@@ -312,10 +362,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_project(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_project(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         self.expect(TokenKind::Thedu)?;
         let cols = self.parse_column_list(arena)?;
-        arena.alloc(AstNode {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Project,
             op: TokenKind::Thedu,
             _pad: [0; 2],
@@ -328,14 +378,14 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_derive(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_derive(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         self.expect(TokenKind::Kani)?;
         let col_tok = self.expect(TokenKind::Ident)?;
         let col = self.alloc_ident(arena, col_tok)?;
         self.expect(TokenKind::Eq)?;
         let lit_tok = self.expect(TokenKind::Number)?;
         let lit = self.alloc_literal(arena, lit_tok)?;
-        arena.alloc(AstNode {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Derive,
             op: TokenKind::Kani,
             _pad: [0; 2],
@@ -348,11 +398,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_group(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_group(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         self.expect(TokenKind::Thoguppu)?;
         let col_tok = self.expect(TokenKind::Ident)?;
         let col = self.alloc_ident(arena, col_tok)?;
-        arena.alloc(AstNode {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Group,
             op: TokenKind::Thoguppu,
             _pad: [0; 2],
@@ -365,11 +415,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_aggregate(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_aggregate(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         self.expect(TokenKind::Surukku)?;
         let col_tok = self.expect(TokenKind::Ident)?;
         let col = self.alloc_ident(arena, col_tok)?;
-        arena.alloc(AstNode {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Aggregate,
             op: TokenKind::Surukku,
             _pad: [0; 2],
@@ -382,7 +432,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_join(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_join(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         self.expect(TokenKind::Inai)?;
         let rel_tok = self.expect(TokenKind::Ident)?;
         let rel = self.alloc_ident(arena, rel_tok)?;
@@ -394,7 +444,7 @@ impl<'a> Parser<'a> {
             let op_tok = self.bump();
             let right_tok = self.expect(TokenKind::Ident)?;
             let right = self.alloc_ident(arena, right_tok)?;
-            pred = arena.alloc(AstNode {
+            pred = arena.try_alloc(AstNode {
                 kind: NodeKind::BinOp,
                 op: op_tok.kind,
                 _pad: [0; 2],
@@ -406,7 +456,7 @@ impl<'a> Parser<'a> {
                 next: NIL,
             })?;
         }
-        arena.alloc(AstNode {
+        arena.try_alloc(AstNode {
             kind: NodeKind::Join,
             op: TokenKind::Inai,
             _pad: [0; 2],
@@ -419,11 +469,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_from(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_from(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         self.expect(TokenKind::Irundu)?;
         let rel_tok = self.expect(TokenKind::Ident)?;
         let rel = self.alloc_ident(arena, rel_tok)?;
-        arena.alloc(AstNode {
+        arena.try_alloc(AstNode {
             kind: NodeKind::From,
             op: TokenKind::Irundu,
             _pad: [0; 2],
@@ -436,7 +486,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_stage(&mut self, arena: &mut AstArena) -> Option<u32> {
+    fn parse_stage(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         match self.peek().kind {
             TokenKind::Irundu => self.parse_from(arena),
             TokenKind::Vadi => self.parse_filter(arena),
@@ -447,14 +497,16 @@ impl<'a> Parser<'a> {
             TokenKind::Surukku => self.parse_aggregate(arena),
             TokenKind::Inai => self.parse_join(arena),
             TokenKind::Thedu => self.parse_project(arena),
-            _ => None,
+            TokenKind::Eof => Err(ParseError::EmptyInput),
+            _ => Err(ParseError::UnexpectedToken),
         }
     }
 
-    /// Parse a full pipeline into `arena`. Returns the root node index.
-    pub fn parse_pipeline(&mut self, arena: &mut AstArena) -> Option<u32> {
+    /// Parse a full pipeline into `arena`. Returns the root node index or a
+    /// defensive [`ParseError`] (including arena overflow).
+    pub fn parse_pipeline(&mut self, arena: &mut AstArena) -> Result<u32, ParseError> {
         let first = self.parse_stage(arena)?;
-        let root = arena.alloc(AstNode {
+        let root = arena.try_alloc(AstNode {
             kind: NodeKind::Pipeline,
             op: TokenKind::Eof,
             _pad: [0; 2],
@@ -484,11 +536,10 @@ impl<'a> Parser<'a> {
             if kind == TokenKind::Eof {
                 break;
             }
-            // Unexpected token — abort.
-            return None;
+            return Err(ParseError::UnexpectedToken);
         }
         arena.root = root;
-        Some(root)
+        Ok(root)
     }
 
     #[inline(always)]
@@ -497,9 +548,9 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Convenience: lex + parse a query string into a fresh arena.
-pub fn parse_query<'a>(src: &'a [u8], arena: &mut AstArena) -> Option<u32> {
-    let mut parser = Parser::from_source(src);
+/// Lex + parse a query into `arena`, surfacing arena / UTF-8 faults explicitly.
+pub fn parse_query(src: &[u8], arena: &mut AstArena) -> Result<u32, ParseError> {
+    let mut parser = Parser::try_from_source(src)?;
     parser.parse_pipeline(arena)
 }
 
@@ -528,5 +579,17 @@ mod tests {
         assert_eq!(kinds[3], NodeKind::Take);
         assert_eq!(kinds[4], NodeKind::Project);
         assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn arena_overflow_returns_defensive_error() {
+        let q = "இருந்து பயனர்கள் | வடி வயது > 21 | அடுக்கு வயது | எடு 10 | தேடு பெயர், வயது;";
+        let mut arena = AstArena::new();
+        // Saturate the flat structural boundary before parsing.
+        arena.len = AST_CAP as u32;
+        let err = parse_query(q.as_bytes(), &mut arena).expect_err("must overflow");
+        assert_eq!(err, ParseError::ArenaOverflow);
+        // No panic / no OOB — len stays at capacity.
+        assert!(arena.is_full());
     }
 }

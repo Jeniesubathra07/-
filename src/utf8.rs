@@ -60,24 +60,68 @@ pub const IS_OP_LUT: [u8; 256] = {
     t
 };
 
+/// Continuation-byte LUT (0x80..0xBF).
+pub const IS_CONT_LUT: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0x80u8;
+    loop {
+        t[i as usize] = 1;
+        if i == 0xBF {
+            break;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// Result of a checked UTF-8 / grapheme advance.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Utf8ScanStatus {
+    Ok = 0,
+    /// Truncated multi-byte sequence or torn Tamil syllable at buffer end.
+    Malformed = 1,
+}
+
+/// Validate a UTF-8 scalar starting at `i`. Returns the end offset on success.
+#[inline(always)]
+pub fn checked_char_end(bytes: &[u8], i: usize) -> Result<usize, Utf8ScanStatus> {
+    if i >= bytes.len() {
+        return Err(Utf8ScanStatus::Malformed);
+    }
+    let b0 = bytes[i];
+    let len = UTF8_LEN_LUT[b0 as usize] as usize;
+    if len == 0 {
+        return Err(Utf8ScanStatus::Malformed);
+    }
+    let end = i + len;
+    if end > bytes.len() {
+        // Truncated multi-byte sequence (mid-codepoint / mid-syllable cut).
+        return Err(Utf8ScanStatus::Malformed);
+    }
+    let mut k = i + 1;
+    while k < end {
+        if IS_CONT_LUT[bytes[k] as usize] == 0 {
+            return Err(Utf8ScanStatus::Malformed);
+        }
+        k += 1;
+    }
+    Ok(end)
+}
+
 /// Advance `i` to the next UTF-8 character boundary (or end).
+/// Prefer [`checked_char_end`] on hot paths that must reject torn syllables.
 #[inline(always)]
 pub fn next_char_boundary(bytes: &[u8], i: usize) -> usize {
-    if i >= bytes.len() {
-        return bytes.len();
+    match checked_char_end(bytes, i) {
+        Ok(end) => end,
+        Err(_) => i.wrapping_add(1).min(bytes.len()),
     }
-    let len = UTF8_LEN_LUT[bytes[i] as usize] as usize;
-    let end = i.wrapping_add(len);
-    let ok = (len != 0) & (end <= bytes.len());
-    // Branchless select: if ok use end else i+1 (best-effort recover).
-    let fallback = i.wrapping_add(1).min(bytes.len());
-    (end & (0usize.wrapping_sub(ok as usize))) | (fallback & (0usize.wrapping_sub((!ok) as usize)))
 }
 
 /// Tamil Unicode block helpers (BMP range U+0B80..U+0BFF encoded as 3-byte UTF-8).
 #[inline(always)]
 pub fn is_tamil_lead(b0: u8, b1: u8) -> bool {
-    // Tamil: E0 AE 80 .. E0 AF BF  =>  lead E0, second AE or AF
     (b0 == 0xE0) & ((b1 == 0xAE) | (b1 == 0xAF))
 }
 
@@ -91,38 +135,66 @@ pub fn decode_tamil_cp(b0: u8, b1: u8, b2: u8) -> u32 {
 /// the preceding consonant (prevents syllable tearing on slice boundaries).
 #[inline(always)]
 pub fn is_tamil_combining(cp: u32) -> bool {
-    // Virama U+0BCD, vowel signs U+0BBE..U+0BCC, U+0BD7
     ((cp >= 0x0BBE) & (cp <= 0x0BCC)) | (cp == 0x0BCD) | (cp == 0x0BD7)
 }
 
-/// Extend `end` forward while the next codepoint is a Tamil combining mark.
-/// Callers pass a char boundary `end` that already includes a base character.
+/// True for Tamil consonants that commonly host a following vowel sign.
 #[inline(always)]
-pub fn extend_grapheme_cluster(bytes: &[u8], mut end: usize) -> usize {
+pub fn is_tamil_consonant(cp: u32) -> bool {
+    (cp >= 0x0B95) & (cp <= 0x0BB9)
+}
+
+/// Extend `end` forward while the next codepoint is a Tamil combining mark.
+/// Returns `Malformed` if a combining-mark lead is truncated at EOF (mid-syllable).
+#[inline(always)]
+pub fn extend_grapheme_cluster_checked(
+    bytes: &[u8],
+    mut end: usize,
+) -> Result<usize, Utf8ScanStatus> {
     loop {
-        if end + 3 > bytes.len() {
+        if end >= bytes.len() {
             break;
         }
+        // Partial lead leftover at EOF ⇒ torn syllable / truncated UTF-8.
+        let remaining = bytes.len() - end;
         let b0 = bytes[end];
+        let need = UTF8_LEN_LUT[b0 as usize] as usize;
+        if need == 0 {
+            return Err(Utf8ScanStatus::Malformed);
+        }
+        if remaining < need {
+            return Err(Utf8ScanStatus::Malformed);
+        }
+        if need != 3 {
+            break;
+        }
         let b1 = bytes[end + 1];
         let b2 = bytes[end + 2];
         let tamil = is_tamil_lead(b0, b1);
         let cp = decode_tamil_cp(b0, b1, b2);
         let comb = is_tamil_combining(cp);
-        // continue only when tamil && comb
-        let cont = tamil & comb;
-        if cont == false {
+        if !(tamil & comb) {
             break;
+        }
+        // Validate continuations.
+        if IS_CONT_LUT[b1 as usize] == 0 || IS_CONT_LUT[b2 as usize] == 0 {
+            return Err(Utf8ScanStatus::Malformed);
         }
         end += 3;
     }
-    end
+    Ok(end)
+}
+
+/// Extend `end` forward while the next codepoint is a Tamil combining mark.
+#[inline(always)]
+pub fn extend_grapheme_cluster(bytes: &[u8], end: usize) -> usize {
+    extend_grapheme_cluster_checked(bytes, end).unwrap_or(end)
 }
 
 /// Find the end of the current identifier / keyword starting at `start`.
-/// Includes full Tamil grapheme clusters; stops at whitespace or operators.
+/// Rejects truncated UTF-8 and mid-syllable cuts at the buffer tail.
 #[inline(always)]
-pub fn scan_ident_end(bytes: &[u8], start: usize) -> usize {
+pub fn scan_ident_end_checked(bytes: &[u8], start: usize) -> Result<usize, Utf8ScanStatus> {
     let mut i = start;
     while i < bytes.len() {
         let b = bytes[i];
@@ -130,10 +202,16 @@ pub fn scan_ident_end(bytes: &[u8], start: usize) -> usize {
         if stop {
             break;
         }
-        let next = next_char_boundary(bytes, i);
-        i = extend_grapheme_cluster(bytes, next);
+        let next = checked_char_end(bytes, i)?;
+        i = extend_grapheme_cluster_checked(bytes, next)?;
     }
-    i
+    Ok(i)
+}
+
+/// Find the end of the current identifier / keyword starting at `start`.
+#[inline(always)]
+pub fn scan_ident_end(bytes: &[u8], start: usize) -> usize {
+    scan_ident_end_checked(bytes, start).unwrap_or(start)
 }
 
 /// Validate that `slice` is valid UTF-8 and return it as `&str` pinned to `bytes`.
