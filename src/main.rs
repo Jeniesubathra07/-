@@ -13,7 +13,7 @@ fn main() {
 
     let catalog = demo_catalog();
     let mut arena = Box::new(AstArena::new());
-    let mut out = Box::new(QueryResult::new());
+    let mut out = QueryResult::new_boxed();
 
     if !run_query(&query, &catalog, &mut arena, &mut out) {
         eprintln!("error: failed to parse or execute query");

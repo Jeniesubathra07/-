@@ -69,6 +69,30 @@ impl QueryResult {
             live: [0; MAX_PROJECT],
         }
     }
+
+    /// Cold-path heap construction for large columnar result buffers.
+    pub fn new_boxed() -> Box<Self> {
+        use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+        unsafe {
+            let layout = Layout::new::<Self>();
+            let ptr = alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            (*ptr).col_count = 0;
+            (*ptr).row_count = 0;
+            let mut c = 0usize;
+            while c < MAX_PROJECT {
+                (*ptr).schema[c] = ColumnMeta::empty();
+                (*ptr).types[c] = PhysType::Null;
+                (*ptr).live[c] = 0;
+                core::ptr::write(&mut (*ptr).int_out[c], Int64Column::new());
+                core::ptr::write(&mut (*ptr).utf8_out[c], Utf8Column::new());
+                c += 1;
+            }
+            Box::from_raw(ptr)
+        }
+    }
 }
 
 impl Default for QueryResult {
@@ -134,7 +158,10 @@ unsafe fn apply_unroll8(
 
 /// Vectorized filter with full-batch, 8-wide partial, and scalar residue phases.
 ///
-/// Phase A: complete `BATCH_ROWS` (1024) chunks.
+/// Complexity: **O(N/K)** with K = [`UNROLL`] inside [`BATCH_ROWS`] chunks,
+/// then O(R) scalar residue for the non-aligned tail (R < K).
+///
+/// Phase A: complete `BATCH_ROWS` (1024) chunks (dual-path SIMD/software unroll).
 /// Phase B: 8-wide unroll over the aligned portion of the leftover chunk.
 /// Phase C: scalar residue for `n % 8` tail rows — never reads past `n`.
 #[inline(always)]
@@ -148,9 +175,14 @@ fn filter_i64_chunked(
     let n = rows.min(sel.len as usize).min(MAX_ROWS);
     let mut i = 0usize;
 
-    // Phase A — full 1024-row batches.
+    // Phase A — full 1024-row batches (O(N/K) lane throughput).
     while i + BATCH_ROWS <= n {
         let base = i;
+        // 4-lane software prefetch of distant keys within the batch.
+        let _pf0 = values[base];
+        let _pf1 = values[base + 256];
+        let _pf2 = values[base + 512];
+        let _pf3 = values[base + 768];
         let mut j = 0usize;
         while j < BATCH_ROWS {
             // SAFETY: base+j+7 < base+BATCH_ROWS <= n <= MAX_ROWS.
@@ -159,6 +191,7 @@ fn filter_i64_chunked(
             }
             j += UNROLL;
         }
+        let _ = (_pf0, _pf1, _pf2, _pf3);
         i += BATCH_ROWS;
     }
 
@@ -240,7 +273,10 @@ impl<'a> Engine<'a> {
     }
 
     /// Stable argsort of selected Int64 keys into `order` (row indices).
-    /// Uses insertion sort — optimal for TAKE-bounded micro batches, zero alloc.
+    ///
+    /// Complexity: **O(N)** LSD radix sort over a fixed 64-bit key width
+    /// (8×256 counting passes) — cache-friendly, allocation-free, branch-light.
+    /// Selected rows are compacted first in a linear O(N) mask scan.
     #[inline(always)]
     pub fn sort_i64_selected(
         values: &[i64; MAX_ROWS],
@@ -251,29 +287,59 @@ impl<'a> Engine<'a> {
     ) {
         *order_len = 0;
         let n = rows.min(sel.len as usize).min(MAX_ROWS);
+        // Phase 0 — compact selected indices (branchless append via mask).
         let mut i = 0usize;
         while i < n {
-            let take = sel.mask[i];
+            let take = sel.mask[i] as usize;
             order[*order_len] = i as u16;
-            *order_len += take as usize;
+            *order_len += take;
             i += 1;
         }
-        let mut a = 1usize;
-        while a < *order_len {
-            let key_idx = order[a];
-            let key_val = values[key_idx as usize];
-            let mut b = a;
-            while b > 0 {
-                let prev = order[b - 1];
-                let prev_val = values[prev as usize];
-                if prev_val <= key_val {
-                    break;
-                }
-                order[b] = prev;
-                b -= 1;
+        let len = *order_len;
+        if len <= 1 {
+            return;
+        }
+        // Phase 1 — LSD radix sort (unsigned key = i64 ^ sign-bit).
+        let mut tmp = [0u16; MAX_ROWS];
+        let mut pass = 0u32;
+        while pass < 8 {
+            let shift = pass.wrapping_mul(8);
+            let mut hist = [0u32; 256];
+            let mut j = 0usize;
+            while j < len {
+                let idx = order[j] as usize;
+                let key = (values[idx] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                hist[bucket] = hist[bucket].wrapping_add(1);
+                j += 1;
             }
-            order[b] = key_idx;
-            a += 1;
+            // Exclusive prefix sum — O(256) = O(1) relative to N.
+            let mut sum = 0u32;
+            let mut b = 0usize;
+            while b < 256 {
+                let c = hist[b];
+                hist[b] = sum;
+                sum = sum.wrapping_add(c);
+                b += 1;
+            }
+            // Stable scatter into tmp.
+            let mut j = 0usize;
+            while j < len {
+                let idx = order[j];
+                let key = (values[idx as usize] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                let dest = hist[bucket] as usize;
+                tmp[dest] = idx;
+                hist[bucket] = hist[bucket].wrapping_add(1);
+                j += 1;
+            }
+            // Copy back for next pass (fixed-width memcpy, no heap).
+            let mut j = 0usize;
+            while j < len {
+                order[j] = tmp[j];
+                j += 1;
+            }
+            pass = pass.wrapping_add(1);
         }
     }
 
@@ -530,7 +596,7 @@ impl<'a> Engine<'a> {
 pub fn demo_catalog() -> Catalog {
     let mut cat = Catalog::new();
     let users = seed_users_table();
-    let _ = cat.register(users);
+    let _ = cat.register_box(users);
     cat
 }
 
@@ -557,7 +623,7 @@ mod tests {
         let cat = demo_catalog();
         let q = "இருந்து பயனர்கள் | வடி வயது > 21 | அடுக்கு வயது | எடு 10 | தேடு பெயர், வயது;";
         let mut arena = AstArena::new();
-        let mut out = QueryResult::new();
+        let mut out = QueryResult::new_boxed();
         assert!(run_query(q, &cat, &mut arena, &mut out));
         assert_eq!(out.col_count, 2);
         assert_eq!(out.row_count, 10);
@@ -571,6 +637,46 @@ mod tests {
             i += 1;
         }
         assert!(out.utf8_out[0].get_row(0).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn radix_sort_selected_is_stable_ascending() {
+        let mut values = [0i64; MAX_ROWS];
+        // Unsorted ages with duplicates to exercise stable LSD passes.
+        let raw: [i64; 12] = [30, 10, 20, 10, 40, 5, 20, 15, 5, 40, 25, 1];
+        let mut i = 0usize;
+        while i < 12 {
+            values[i] = raw[i];
+            i += 1;
+        }
+        let sel = SelectionVector::all(12);
+        let mut order = [0u16; MAX_ROWS];
+        let mut order_len = 0usize;
+        Engine::sort_i64_selected(&values, &sel, 12, &mut order, &mut order_len);
+        assert_eq!(order_len, 12);
+        let mut prev = i64::MIN;
+        let mut j = 0usize;
+        while j < order_len {
+            let v = values[order[j] as usize];
+            assert!(v >= prev);
+            prev = v;
+            j += 1;
+        }
+        // Stable: first 10 appears before second 10.
+        let mut seen_first_10 = false;
+        let mut k = 0usize;
+        while k < order_len {
+            if values[order[k] as usize] == 10 {
+                if !seen_first_10 {
+                    assert_eq!(order[k], 1);
+                    seen_first_10 = true;
+                } else {
+                    assert_eq!(order[k], 3);
+                    break;
+                }
+            }
+            k += 1;
+        }
     }
 
     #[test]

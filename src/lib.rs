@@ -98,7 +98,7 @@ mod e2e_tests {
     fn demo_pipeline_e2e_zero_heap_and_tamil_safe() {
         let catalog = demo_catalog();
         let mut arena = Box::new(AstArena::new());
-        let mut out = Box::new(QueryResult::new());
+        let mut out = QueryResult::new_boxed();
 
         assert!(DEMO_QUERY.contains("தேடு"));
         assert!(DEMO_QUERY.contains("பெயர்"));
@@ -345,7 +345,7 @@ mod e2e_tests {
         assert_eq!(sel.mask[1024], 1);
         assert_eq!(sel.mask[LIVE], 0xA5);
 
-        let mut table = Table::new("பயனர்கள்".as_bytes());
+        let mut table = Table::new_boxed("பயனர்கள்".as_bytes());
         let age_i = table.add_int64_column("வயது".as_bytes()).unwrap();
         let name_i = table.add_utf8_column("பெயர்".as_bytes()).unwrap();
         {
@@ -369,10 +369,10 @@ mod e2e_tests {
         }
         table.set_row_count(LIVE);
         let mut cat = Catalog::new();
-        let _ = cat.register(table);
+        let _ = cat.register_box(table);
         let q = "இருந்து பயனர்கள் | வடி வயது > 1023 | தேடு வயது;";
         let mut arena = Box::new(AstArena::new());
-        let mut out = Box::new(QueryResult::new());
+        let mut out = QueryResult::new_boxed();
         assert!(run_query(q, &cat, &mut arena, &mut out));
         assert_eq!(out.row_count, 1);
         assert_eq!(out.int_out[0].values[0], 1024);
@@ -411,7 +411,7 @@ mod e2e_tests {
         // Zero-heap hot path integrity under the tracking allocator.
         let catalog = demo_catalog();
         let mut arena = Box::new(AstArena::new());
-        let mut out = Box::new(QueryResult::new());
+        let mut out = QueryResult::new_boxed();
         reset_counters();
         set_tracking(true);
         let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out);
@@ -419,5 +419,85 @@ mod e2e_tests {
         assert!(ok);
         assert_eq!(alloc_count(), 0);
         assert_eq!(alloc_bytes(), 0);
+    }
+
+    /// Ω-COMPLEXITY-MAX: demo query zero-heap + 2050-row dual-batch residue path.
+    #[test]
+    fn complexity_max_e2e_2050_remainder_and_demo_zero_heap() {
+        // --- A: canonical Tamil pipeline, zero hot-path heap ---
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        reset_counters();
+        set_tracking(true);
+        assert!(run_query(DEMO_QUERY, &catalog, &mut arena, &mut out));
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0);
+        assert_eq!(out.row_count, 10);
+        let expected: [i64; 10] = [22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
+        let mut j = 0usize;
+        while j < 10 {
+            assert_eq!(out.int_out[1].values[j], expected[j]);
+            j += 1;
+        }
+
+        // --- B: 2050 rows = 2×1024 SIMD batches + 2 scalar residue rows ---
+        const LIVE: usize = 2050;
+        assert_eq!(LIVE / BATCH_ROWS, 2);
+        assert_eq!(LIVE % BATCH_ROWS, 2);
+
+        let mut values = [0i64; MAX_ROWS];
+        let mut i = 0usize;
+        while i < LIVE {
+            values[i] = i as i64;
+            i += 1;
+        }
+        let mut sel = SelectionVector::all(LIVE);
+        Engine::filter_i64_gt(&values, &mut sel, LIVE, 2047);
+        // Rows 2048, 2049 kept (the 2-row scalar residue after two full batches).
+        assert_eq!(sel.mask[2047], 0);
+        assert_eq!(sel.mask[2048], 1);
+        assert_eq!(sel.mask[2049], 1);
+
+        let mut order = [0u16; MAX_ROWS];
+        let mut order_len = 0usize;
+        Engine::sort_i64_selected(&values, &sel, LIVE, &mut order, &mut order_len);
+        assert_eq!(order_len, 2);
+        assert_eq!(order[0], 2048);
+        assert_eq!(order[1], 2049);
+
+        // End-to-end against a 2050-row columnar relation.
+        let mut table = Table::new_boxed("பயனர்கள்".as_bytes());
+        let age_i = table.add_int64_column("வயது".as_bytes()).unwrap();
+        let name_i = table.add_utf8_column("பெயர்".as_bytes()).unwrap();
+        {
+            let col = table.int64_mut(age_i).unwrap();
+            let mut r = 0usize;
+            while r < LIVE {
+                col.values[r] = r as i64;
+                col.validity.set(r, true);
+                r += 1;
+            }
+        }
+        {
+            let col = table.utf8_mut(name_i).unwrap();
+            col.clear();
+            let mut r = 0usize;
+            while r < LIVE {
+                let b = [b'0' + (r % 10) as u8];
+                assert!(col.set_row(r, &b));
+                r += 1;
+            }
+        }
+        table.set_row_count(LIVE);
+        let mut cat = Catalog::new();
+        let _ = cat.register_box(table);
+        let q = "இருந்து பயனர்கள் | வடி வயது > 2047 | அடுக்கு வயது | எடு 10 | தேடு வயது;";
+        let mut arena2 = Box::new(AstArena::new());
+        let mut out2 = QueryResult::new_boxed();
+        assert!(run_query(q, &cat, &mut arena2, &mut out2));
+        assert_eq!(out2.row_count, 2);
+        assert_eq!(out2.int_out[0].values[0], 2048);
+        assert_eq!(out2.int_out[0].values[1], 2049);
     }
 }

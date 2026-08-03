@@ -16,10 +16,11 @@ pub const BATCH_ROWS: usize = 1024;
 pub const MAX_COLUMNS: usize = 8;
 
 /// Maximum rows in an in-core table segment (supports multi-batch + scalar tail).
-pub const MAX_ROWS: usize = 2048;
+/// Sized for ≥2050-row integration scans while staying 64-byte / 1024-batch aligned.
+pub const MAX_ROWS: usize = 4096;
 
 /// Maximum bytes in the shared UTF-8 data slab for Utf8 columns.
-pub const UTF8_SLAB_CAP: usize = 4096;
+pub const UTF8_SLAB_CAP: usize = 8192;
 
 /// Maximum length of a column / relation name (bytes).
 pub const NAME_CAP: usize = 64;
@@ -290,6 +291,29 @@ impl Table {
         }
     }
 
+    /// Cold-path heap construction — avoids placing a multi-hundred-KB `Table`
+    /// temporary on the caller's stack frame.
+    pub fn new_boxed(name: &[u8]) -> Box<Self> {
+        use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+        unsafe {
+            let layout = Layout::new::<Self>();
+            let ptr = alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            (*ptr).name = ColName::from_bytes(name);
+            (*ptr).col_count = 0;
+            (*ptr).row_count = 0;
+            let mut i = 0usize;
+            while i < MAX_COLUMNS {
+                core::ptr::write(&mut (*ptr).columns[i], ColumnData::Null);
+                (*ptr).col_meta[i] = ColumnMeta::empty();
+                i += 1;
+            }
+            Box::from_raw(ptr)
+        }
+    }
+
     #[inline(always)]
     pub fn add_int64_column(&mut self, name: &[u8]) -> Option<usize> {
         let i = self.col_count as usize;
@@ -443,11 +467,15 @@ impl Catalog {
     }
 
     pub fn register(&mut self, table: Table) -> Option<usize> {
+        self.register_box(Box::new(table))
+    }
+
+    pub fn register_box(&mut self, table: Box<Table>) -> Option<usize> {
         let i = self.len as usize;
         if i >= MAX_TABLES {
             return None;
         }
-        self.tables[i] = Some(Box::new(table));
+        self.tables[i] = Some(table);
         self.len = self.len.wrapping_add(1);
         Some(i)
     }
@@ -532,8 +560,8 @@ impl SelectionVector {
 }
 
 /// Build the demo `பயனர்கள்` (users) table used by the integration harness.
-pub fn seed_users_table() -> Table {
-    let mut t = Table::new("பயனர்கள்".as_bytes());
+pub fn seed_users_table() -> Box<Table> {
+    let mut t = Table::new_boxed("பயனர்கள்".as_bytes());
     let name_i = t.add_utf8_column("பெயர்".as_bytes()).unwrap();
     let age_i = t.add_int64_column("வயது".as_bytes()).unwrap();
 
@@ -602,7 +630,6 @@ mod tests {
         let age = t.find_column("வயது".as_bytes()).unwrap();
         assert_eq!(t.utf8(name).unwrap().get_row(1), Some("பிரியா"));
         assert_eq!(t.int64(age).unwrap().values[1], 22);
-        // Grapheme-safe: பெயர் / தே markers stay intact
         assert_eq!(t.col_meta[name].name.as_bytes(), "பெயர்".as_bytes());
     }
 }
