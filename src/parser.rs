@@ -32,6 +32,9 @@ pub enum ParserError {
     MissingSourceContext = 5,
 }
 
+/// AST / pipeline operator kind (alias for [`NodeKind`]; includes `Join`).
+pub type OpKind = NodeKind;
+
 /// Compatibility aliases.
 pub type ParseError = ParserError;
 /// Historical name retained for call-site clarity.

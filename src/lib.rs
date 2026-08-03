@@ -19,13 +19,16 @@ pub mod storage;
 pub mod utf8;
 
 pub use lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
-pub use parser::{
-    parse_query, AstArena, AstNode, NodeKind, ParseError, Parser, ParserError, AST_CAP, NIL,
+pub use runtime::{
+    demo_catalog, lsd_radix_sort_ages, run_query, vector_merge_join, Engine, QueryResult,
 };
-pub use runtime::{demo_catalog, lsd_radix_sort_ages, run_query, Engine, QueryResult};
 pub use storage::{
-    seed_users_table, Catalog, ColName, ColumnData, Int64Column, PhysType, SelectionVector, Table,
-    Utf8Column, BATCH_ROWS, MAX_ROWS,
+    seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColName, ColumnData,
+    FixedOrdersDatabase, Int64Column, PhysType, SelectionVector, Table, Utf8Column, BATCH_ROWS,
+    MAX_ROWS,
+};
+pub use parser::{
+    parse_query, AstArena, AstNode, NodeKind, OpKind, ParseError, Parser, ParserError, AST_CAP, NIL,
 };
 
 /// Canonical end-to-end demo query from the system specification.
@@ -587,5 +590,69 @@ mod e2e_tests {
         assert_eq!(out2.row_count, 2);
         assert_eq!(out2.int_out[0].values[0], 2048);
         assert_eq!(out2.int_out[0].values[1], 2049);
+    }
+
+    /// INF-STAGE2: sort-merge join via `இணை ஆர்டர்கள்` — zero heap, O(N+M).
+    #[test]
+    fn stage2_inai_sort_merge_join_zero_heap() {
+        let q = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | வடி வயது > 21 | தேடு பெயர், விலை;";
+        // Lexer must recognize இணை without grapheme tear.
+        let mut lex = Lexer::new(q.as_bytes());
+        let mut saw_inai = false;
+        loop {
+            match lex.next_token() {
+                Ok(t) if t.kind == TokenKind::Eof => break,
+                Ok(t) if t.kind == TokenKind::Inai => {
+                    assert_eq!(t.text(q.as_bytes()), Some("இணை"));
+                    saw_inai = true;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("lex fault: {e:?}"),
+            }
+        }
+        assert!(saw_inai);
+
+        let catalog = demo_catalog();
+        assert!(catalog.orders.is_some());
+        assert!(catalog.find("ஆர்டர்கள்".as_bytes()).is_some());
+        assert_eq!(
+            core::mem::align_of::<FixedOrdersDatabase>(),
+            64
+        );
+
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        reset_counters();
+        set_tracking(true);
+        assert!(run_query(q, &catalog, &mut arena, &mut out));
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0, "join hot path must not allocate");
+        assert_eq!(out.col_count, 2);
+        assert_eq!(out.schema[0].name.as_bytes(), "பெயர்".as_bytes());
+        assert_eq!(out.schema[1].name.as_bytes(), "விலை".as_bytes());
+        // Orders with user age > 21: all seeded except user_id 0 (age 18).
+        assert_eq!(out.row_count, 11);
+        let mut i = 0usize;
+        while i < out.row_count as usize {
+            let name = out.utf8_out[0].get_row(i).expect("name");
+            assert!(!name.is_empty());
+            let price = out.int_out[1].values[i];
+            assert!(price > 0);
+            i += 1;
+        }
+
+        // Direct vector_merge_join unit check.
+        let mut left = [0i64; MAX_ROWS];
+        let mut right = [0i64; MAX_ROWS];
+        left[0] = 1;
+        left[1] = 2;
+        left[2] = 3;
+        right[0] = 3;
+        right[1] = 1;
+        right[2] = 9;
+        let mut ol = [0u16; MAX_ROWS];
+        let mut oright = [0u16; MAX_ROWS];
+        let n = vector_merge_join(&left, 3, &right, 3, &mut ol, &mut oright);
+        assert_eq!(n, 2);
     }
 }

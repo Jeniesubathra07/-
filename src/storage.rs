@@ -460,6 +460,7 @@ pub const MAX_TABLES: usize = 8;
 #[repr(C)]
 pub struct Catalog {
     pub tables: [Option<Box<Table>>; MAX_TABLES],
+    pub orders: Option<Box<FixedOrdersDatabase>>,
     pub len: u16,
     pub _pad: [u8; 6],
 }
@@ -468,6 +469,7 @@ impl Catalog {
     pub fn new() -> Self {
         Self {
             tables: [None, None, None, None, None, None, None, None],
+            orders: None,
             len: 0,
             _pad: [0; 6],
         }
@@ -485,6 +487,10 @@ impl Catalog {
         self.tables[i] = Some(table);
         self.len = self.len.wrapping_add(1);
         Some(i)
+    }
+
+    pub fn set_orders(&mut self, orders: Box<FixedOrdersDatabase>) {
+        self.orders = Some(orders);
     }
 
     pub fn find(&self, name: &[u8]) -> Option<&Table> {
@@ -572,6 +578,7 @@ const _: () = assert!(core::mem::align_of::<Table>() == 64);
 /// Build the demo `பயனர்கள்` (users) table used by the integration harness.
 pub fn seed_users_table() -> Box<Table> {
     let mut t = Table::new_boxed("பயனர்கள்".as_bytes());
+    let id_i = t.add_int64_column("அடையாளம்".as_bytes()).unwrap();
     let name_i = t.add_utf8_column("பெயர்".as_bytes()).unwrap();
     let age_i = t.add_int64_column("வயது".as_bytes()).unwrap();
 
@@ -598,6 +605,15 @@ pub fn seed_users_table() -> Box<Table> {
     ];
 
     {
+        let ids = t.int64_mut(id_i).unwrap();
+        let mut r = 0usize;
+        while r < 16 {
+            ids.values[r] = r as i64;
+            ids.validity.set(r, true);
+            r += 1;
+        }
+    }
+    {
         let utf8 = t.utf8_mut(name_i).unwrap();
         utf8.clear();
         let mut r = 0usize;
@@ -616,6 +632,102 @@ pub fn seed_users_table() -> Box<Table> {
         }
     }
     t.set_row_count(16);
+    t
+}
+
+/// Secondary packed orders relation for sort-merge joins (`ஆர்டர்கள்`).
+#[repr(C, align(64))]
+pub struct FixedOrdersDatabase {
+    pub user_id_column: [i64; MAX_ROWS],
+    pub price_column: [i64; MAX_ROWS],
+    pub row_count: u16,
+    pub _pad: [u8; 6],
+}
+
+const _: () = assert!(core::mem::align_of::<FixedOrdersDatabase>() == 64);
+
+impl FixedOrdersDatabase {
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self {
+            user_id_column: [0; MAX_ROWS],
+            price_column: [0; MAX_ROWS],
+            row_count: 0,
+            _pad: [0; 6],
+        }
+    }
+
+    /// Cold-path heap construction (orders buffers are multi-hundred KB).
+    pub fn new_boxed() -> Box<Self> {
+        use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+        unsafe {
+            let layout = Layout::new::<Self>();
+            let ptr = alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            (*ptr).row_count = 0;
+            Box::from_raw(ptr)
+        }
+    }
+}
+
+/// Seed `ஆர்டர்கள்` — user_id keys align with பயனர்கள்.அடையாளம்.
+pub fn seed_orders_database() -> Box<FixedOrdersDatabase> {
+    let mut o = FixedOrdersDatabase::new_boxed();
+    // 12 orders spanning ages above/below the வயது > 21 filter boundary.
+    // user_id → row in users; price in விலை units.
+    let pairs: [(i64, i64); 12] = [
+        (1, 450),  // பிரியா age 22
+        (3, 800),  // லட்சுமி age 25
+        (4, 1200), // முருகன் age 30
+        (6, 350),  // ராஜ் age 27
+        (7, 600),  // மீனா age 24
+        (9, 900),  // தீபா age 35
+        (10, 500), // விஜய் age 28
+        (12, 700), // கோபால் age 23
+        (13, 550), // சுமதி age 26
+        (14, 1100),// கார்த்திக் age 31
+        (15, 400), // நந்தினி age 29
+        (0, 100),  // அருண் age 18 (filtered out by வயது > 21)
+    ];
+    let n = pairs.len();
+    let mut i = 0usize;
+    while i < n {
+        o.user_id_column[i] = pairs[i].0;
+        o.price_column[i] = pairs[i].1;
+        i += 1;
+    }
+    o.row_count = n as u16;
+    o
+}
+
+/// Also expose orders as a columnar `Table` named `ஆர்டர்கள்` for catalog lookup.
+pub fn seed_orders_table() -> Box<Table> {
+    let mut t = Table::new_boxed("ஆர்டர்கள்".as_bytes());
+    let uid = t.add_int64_column("அடையாளம்".as_bytes()).unwrap();
+    let price = t.add_int64_column("விலை".as_bytes()).unwrap();
+    let orders = seed_orders_database();
+    let n = orders.row_count as usize;
+    {
+        let c = t.int64_mut(uid).unwrap();
+        let mut i = 0usize;
+        while i < n {
+            c.values[i] = orders.user_id_column[i];
+            c.validity.set(i, true);
+            i += 1;
+        }
+    }
+    {
+        let c = t.int64_mut(price).unwrap();
+        let mut i = 0usize;
+        while i < n {
+            c.values[i] = orders.price_column[i];
+            c.validity.set(i, true);
+            i += 1;
+        }
+    }
+    t.set_row_count(n);
     t
 }
 

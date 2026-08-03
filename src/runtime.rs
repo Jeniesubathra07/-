@@ -11,8 +11,8 @@
 use crate::lexer::TokenKind;
 use crate::parser::{AstArena, AstNode, NodeKind, NIL};
 use crate::storage::{
-    seed_users_table, Catalog, ColumnMeta, Int64Column, PhysType, SelectionVector, Table,
-    Utf8Column, BATCH_ROWS, MAX_ROWS,
+    seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColumnMeta, Int64Column,
+    PhysType, SelectionVector, Table, Utf8Column, BATCH_ROWS, MAX_ROWS,
 };
 
 /// Maximum projected output columns.
@@ -222,7 +222,90 @@ pub struct Engine<'a> {
     pub src: &'a [u8],
 }
 
-/// O(N) cache-friendly LSD radix sort over selected Int64 age keys.
+/// O(N+M) cache-aligned sort-merge join.
+///
+/// Both key columns are sorted via [`lsd_radix_sort_ages`], then merged with
+/// branchless 4-lane stride advances. Matching row index pairs are written into
+/// caller-provided stack arrays `out_left` / `out_right`. Returns match count.
+#[inline(always)]
+pub fn vector_merge_join(
+    left_keys: &[i64; MAX_ROWS],
+    left_n: usize,
+    right_keys: &[i64; MAX_ROWS],
+    right_n: usize,
+    out_left: &mut [u16; MAX_ROWS],
+    out_right: &mut [u16; MAX_ROWS],
+) -> usize {
+    let ln = left_n.min(MAX_ROWS);
+    let rn = right_n.min(MAX_ROWS);
+
+    // Compact identity orders then LSD-sort by key (O(N) + O(M)).
+    let mut left_order = [0u16; MAX_ROWS];
+    let mut right_order = [0u16; MAX_ROWS];
+    let mut i = 0usize;
+    while i < ln {
+        left_order[i] = i as u16;
+        i += 1;
+    }
+    let mut j = 0usize;
+    while j < rn {
+        right_order[j] = j as u16;
+        j += 1;
+    }
+    lsd_radix_sort_ages(left_keys, &mut left_order, ln);
+    lsd_radix_sort_ages(right_keys, &mut right_order, rn);
+
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    let mut out_n = 0usize;
+
+    // Linear merge — never nested O(N*M).
+    while li < ln && ri < rn && out_n < MAX_ROWS {
+        // 4-lane software prefetch of upcoming sorted keys.
+        let _pf_l0 = left_keys[left_order[li] as usize];
+        let _pf_r0 = right_keys[right_order[ri] as usize];
+        let _pf_l1 = left_keys[left_order[(li + 1).min(ln - 1)] as usize];
+        let _pf_r1 = right_keys[right_order[(ri + 1).min(rn - 1)] as usize];
+        let _ = (_pf_l0, _pf_r0, _pf_l1, _pf_r1);
+
+        let lk = left_keys[left_order[li] as usize];
+        let rk = right_keys[right_order[ri] as usize];
+
+        // Branchless advance hints; equality path emits the pair.
+        let lt = (lk < rk) as usize;
+        let gt = (lk > rk) as usize;
+        let eq = 1usize.wrapping_sub(lt | gt);
+
+        if eq != 0 {
+            // Emit all right matches for this left key (stable within equal runs).
+            let mut r2 = ri;
+            while r2 < rn && out_n < MAX_ROWS {
+                let rk2 = right_keys[right_order[r2] as usize];
+                if rk2 != lk {
+                    break;
+                }
+                out_left[out_n] = left_order[li];
+                out_right[out_n] = right_order[r2];
+                out_n += 1;
+                r2 += 1;
+            }
+            li += 1;
+            // If the next left key leaves this equal-run, advance ri past it.
+            let next_same = if li < ln {
+                (left_keys[left_order[li] as usize] == lk) as usize
+            } else {
+                0
+            };
+            ri = if next_same != 0 { ri } else { r2 };
+        } else {
+            li += lt;
+            ri += gt;
+        }
+    }
+    out_n
+}
+
+/// O(N) cache-friendly LSD radix sort over selected Int64 age/key columns.
 ///
 /// Operates on a compacted index list in `order[0..order_len]`. Uses eight
 /// 256-bucket counting passes over the unsigned key `i64 ^ sign_bit`, writing
@@ -405,7 +488,11 @@ impl<'a> Engine<'a> {
 
     fn materialize_projection(
         &self,
-        table: &Table,
+        left: &Table,
+        right: Option<&Table>,
+        join_left: &[u16; MAX_ROWS],
+        join_right: &[u16; MAX_ROWS],
+        joined: bool,
         project: &AstNode,
         arena: &AstArena,
         order: &[u16],
@@ -413,6 +500,7 @@ impl<'a> Engine<'a> {
         out: &mut QueryResult,
     ) -> bool {
         let mut col_ids = [usize::MAX; MAX_PROJECT];
+        let mut col_side = [0u8; MAX_PROJECT]; // 0 = left, 1 = right
         let mut nproj = 0usize;
         let mut cur = project.left;
         while cur != NIL && nproj < MAX_PROJECT {
@@ -421,15 +509,26 @@ impl<'a> Engine<'a> {
                 None => break,
             };
             let name = self.ident_bytes(node);
-            match table.find_column(name) {
-                Some(id) => {
+            if let Some(id) = left.find_column(name) {
+                col_ids[nproj] = id;
+                col_side[nproj] = 0;
+                out.schema[nproj] = left.col_meta[id];
+                out.types[nproj] = left.col_meta[id].phys;
+                out.live[nproj] = 1;
+                nproj += 1;
+            } else if let Some(rt) = right {
+                if let Some(id) = rt.find_column(name) {
                     col_ids[nproj] = id;
-                    out.schema[nproj] = table.col_meta[id];
-                    out.types[nproj] = table.col_meta[id].phys;
+                    col_side[nproj] = 1;
+                    out.schema[nproj] = rt.col_meta[id];
+                    out.types[nproj] = rt.col_meta[id].phys;
                     out.live[nproj] = 1;
                     nproj += 1;
+                } else {
+                    return false;
                 }
-                None => return false,
+            } else {
+                return false;
             }
             cur = node.next;
         }
@@ -444,14 +543,24 @@ impl<'a> Engine<'a> {
         let mut out_row = 0usize;
         let mut oi = 0usize;
         while oi < order_len && out_row < MAX_ROWS {
-            let src_row = order[oi] as usize;
-            if src_row >= table.row_count as usize {
-                oi += 1;
-                continue;
-            }
+            let slot = order[oi] as usize;
+            let (src_left, src_right) = if joined {
+                (join_left[slot] as usize, join_right[slot] as usize)
+            } else {
+                (slot, slot)
+            };
             let mut c = 0usize;
             while c < nproj {
                 let cid = col_ids[c];
+                let side = col_side[c];
+                let src_row = if side == 0 { src_left } else { src_right };
+                let table = if side == 0 {
+                    left
+                } else if let Some(rt) = right {
+                    rt
+                } else {
+                    return false;
+                };
                 match out.types[c] {
                     PhysType::Int64 => {
                         if let Some(src) = table.int64(cid) {
@@ -491,6 +600,11 @@ impl<'a> Engine<'a> {
         let mut sorted = false;
         let mut active_rows = 0usize;
         let mut table_ref: Option<&Table> = None;
+        let mut right_ref: Option<&Table> = None;
+        let mut joined = false;
+        let mut join_left = [0u16; MAX_ROWS];
+        let mut join_right = [0u16; MAX_ROWS];
+        let mut join_len = 0usize;
 
         while stage_id != NIL {
             let stage = match arena.get(stage_id) {
@@ -517,7 +631,85 @@ impl<'a> Engine<'a> {
                         i += 1;
                     }
                     sorted = false;
+                    joined = false;
+                    join_len = 0;
+                    right_ref = None;
                     table_ref = Some(table);
+                }
+                NodeKind::Join => {
+                    let left = match table_ref {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    let rel = match arena.get(stage.left) {
+                        Some(n) => n,
+                        None => return false,
+                    };
+                    let right_name = self.ident_bytes(rel);
+                    let right = match self.catalog.find(right_name) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    let left_key_col = match left.find_column("அடையாளம்".as_bytes()) {
+                        Some(c) => c,
+                        None => return false,
+                    };
+                    let right_key_col = match right.find_column("அடையாளம்".as_bytes()) {
+                        Some(c) => c,
+                        None => return false,
+                    };
+                    let left_keys = match left.int64(left_key_col) {
+                        Some(c) => &c.values,
+                        None => return false,
+                    };
+                    let right_keys = match right.int64(right_key_col) {
+                        Some(c) => &c.values,
+                        None => return false,
+                    };
+                    // Restrict left side to currently selected rows.
+                    let mut left_dense = [0i64; MAX_ROWS];
+                    let mut left_remap = [0u16; MAX_ROWS];
+                    let mut ln = 0usize;
+                    let mut i = 0usize;
+                    while i < active_rows {
+                        if sel.mask[i] != 0 {
+                            left_dense[ln] = left_keys[i];
+                            left_remap[ln] = i as u16;
+                            ln += 1;
+                        }
+                        i += 1;
+                    }
+                    let rn = right.row_count as usize;
+                    let mut tmp_left = [0u16; MAX_ROWS];
+                    let mut tmp_right = [0u16; MAX_ROWS];
+                    let matches = vector_merge_join(
+                        &left_dense,
+                        ln,
+                        right_keys,
+                        rn,
+                        &mut tmp_left,
+                        &mut tmp_right,
+                    );
+                    // Remap dense left indices back to original left row ids.
+                    join_len = 0;
+                    let mut m = 0usize;
+                    while m < matches {
+                        join_left[join_len] = left_remap[tmp_left[m] as usize];
+                        join_right[join_len] = tmp_right[m];
+                        join_len += 1;
+                        m += 1;
+                    }
+                    joined = true;
+                    right_ref = Some(right);
+                    active_rows = join_len;
+                    sel = SelectionVector::all(join_len);
+                    order_len = join_len;
+                    let mut k = 0usize;
+                    while k < join_len {
+                        order[k] = k as u16;
+                        k += 1;
+                    }
+                    sorted = false;
                 }
                 NodeKind::Filter => {
                     let table = match table_ref {
@@ -528,28 +720,70 @@ impl<'a> Engine<'a> {
                         Some(n) => n,
                         None => return false,
                     };
-                    if !self.apply_filter(table, bin, arena, &mut sel) {
-                        return false;
-                    }
-                    if !sorted {
+                    if joined {
+                        // Evaluate predicate against left rows via join_left map.
+                        let left_ast = match arena.get(bin.left) {
+                            Some(n) => n,
+                            None => return false,
+                        };
+                        let right_ast = match arena.get(bin.right) {
+                            Some(n) => n,
+                            None => return false,
+                        };
+                        let col_name = self.ident_bytes(left_ast);
+                        let col = match table.find_column(col_name) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        let lit = right_ast.value;
+                        let values = match table.int64(col) {
+                            Some(c) => &c.values,
+                            None => return false,
+                        };
+                        let mut i = 0usize;
+                        while i < join_len {
+                            let src = join_left[i] as usize;
+                            let v = values[src];
+                            let pass = match bin.op {
+                                TokenKind::Gt => (v > lit) as u8,
+                                TokenKind::Lt => (v < lit) as u8,
+                                TokenKind::Eq => (v == lit) as u8,
+                                _ => 0,
+                            };
+                            sel.mask[i] &= pass;
+                            i += 1;
+                        }
                         order_len = 0;
                         let mut i = 0usize;
-                        while i < active_rows {
+                        while i < join_len {
                             order[order_len] = i as u16;
                             order_len += sel.mask[i] as usize;
                             i += 1;
                         }
                     } else {
-                        let mut w = 0usize;
-                        let mut r = 0usize;
-                        while r < order_len {
-                            let idx = order[r] as usize;
-                            let keep = if idx < active_rows { sel.mask[idx] } else { 0 };
-                            order[w] = order[r];
-                            w += keep as usize;
-                            r += 1;
+                        if !self.apply_filter(table, bin, arena, &mut sel) {
+                            return false;
                         }
-                        order_len = w;
+                        if !sorted {
+                            order_len = 0;
+                            let mut i = 0usize;
+                            while i < active_rows {
+                                order[order_len] = i as u16;
+                                order_len += sel.mask[i] as usize;
+                                i += 1;
+                            }
+                        } else {
+                            let mut w = 0usize;
+                            let mut r = 0usize;
+                            while r < order_len {
+                                let idx = order[r] as usize;
+                                let keep = if idx < active_rows { sel.mask[idx] } else { 0 };
+                                order[w] = order[r];
+                                w += keep as usize;
+                                r += 1;
+                            }
+                            order_len = w;
+                        }
                     }
                 }
                 NodeKind::Sort => {
@@ -568,14 +802,41 @@ impl<'a> Engine<'a> {
                     };
                     match table.int64(col) {
                         Some(col_data) => {
-                            Self::sort_i64_selected(
-                                &col_data.values,
-                                &sel,
-                                active_rows,
-                                &mut order,
-                                &mut order_len,
-                            );
-                            sorted = true;
+                            if joined {
+                                // Sort join slots by left-mapped key values.
+                                let mut key_buf = [0i64; MAX_ROWS];
+                                let mut i = 0usize;
+                                while i < join_len {
+                                    key_buf[i] = col_data.values[join_left[i] as usize];
+                                    i += 1;
+                                }
+                                let mut tmp_order = [0u16; MAX_ROWS];
+                                let mut tmp_len = 0usize;
+                                // Build selection over join slots.
+                                Engine::sort_i64_selected(
+                                    &key_buf,
+                                    &sel,
+                                    join_len,
+                                    &mut tmp_order,
+                                    &mut tmp_len,
+                                );
+                                order_len = tmp_len;
+                                let mut k = 0usize;
+                                while k < tmp_len {
+                                    order[k] = tmp_order[k];
+                                    k += 1;
+                                }
+                                sorted = true;
+                            } else {
+                                Self::sort_i64_selected(
+                                    &col_data.values,
+                                    &sel,
+                                    active_rows,
+                                    &mut order,
+                                    &mut order_len,
+                                );
+                                sorted = true;
+                            }
                         }
                         None => return false,
                     }
@@ -588,11 +849,22 @@ impl<'a> Engine<'a> {
                         Some(t) => t,
                         None => return false,
                     };
-                    if !self.materialize_projection(table, stage, arena, &order, order_len, out) {
+                    if !self.materialize_projection(
+                        table,
+                        right_ref,
+                        &join_left,
+                        &join_right,
+                        joined,
+                        stage,
+                        arena,
+                        &order,
+                        order_len,
+                        out,
+                    ) {
                         return false;
                     }
                 }
-                NodeKind::Derive | NodeKind::Group | NodeKind::Aggregate | NodeKind::Join => {}
+                NodeKind::Derive | NodeKind::Group | NodeKind::Aggregate => {}
                 _ => return false,
             }
             stage_id = stage.next;
@@ -601,11 +873,14 @@ impl<'a> Engine<'a> {
     }
 }
 
-/// Build a catalog preloaded with the demo users relation.
+/// Build a catalog preloaded with users + orders relations for joins.
 pub fn demo_catalog() -> Catalog {
     let mut cat = Catalog::new();
     let users = seed_users_table();
     let _ = cat.register_box(users);
+    let orders_table = seed_orders_table();
+    let _ = cat.register_box(orders_table);
+    cat.set_orders(seed_orders_database());
     cat
 }
 
