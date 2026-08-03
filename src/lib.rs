@@ -22,10 +22,10 @@ pub use lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
 pub use parser::{
     parse_query, AstArena, AstNode, NodeKind, ParseError, Parser, ParserError, AST_CAP, NIL,
 };
-pub use runtime::{demo_catalog, run_query, Engine, QueryResult};
+pub use runtime::{demo_catalog, lsd_radix_sort_ages, run_query, Engine, QueryResult};
 pub use storage::{
-    seed_users_table, Catalog, ColName, ColumnData, PhysType, SelectionVector, Table, BATCH_ROWS,
-    MAX_ROWS,
+    seed_users_table, Catalog, ColName, ColumnData, Int64Column, PhysType, SelectionVector, Table,
+    Utf8Column, BATCH_ROWS, MAX_ROWS,
 };
 
 /// Canonical end-to-end demo query from the system specification.
@@ -495,6 +495,94 @@ mod e2e_tests {
         let q = "இருந்து பயனர்கள் | வடி வயது > 2047 | அடுக்கு வயது | எடு 10 | தேடு வயது;";
         let mut arena2 = Box::new(AstArena::new());
         let mut out2 = QueryResult::new_boxed();
+        assert!(run_query(q, &cat, &mut arena2, &mut out2));
+        assert_eq!(out2.row_count, 2);
+        assert_eq!(out2.int_out[0].values[0], 2048);
+        assert_eq!(out2.int_out[0].values[1], 2049);
+    }
+
+    /// Stage-1 micro-arch layout locks + 2050-row remainder via `lsd_radix_sort_ages`.
+    #[test]
+    fn microarch_stage1_align_radix_and_2050_remainder() {
+        assert_eq!(core::mem::size_of::<AstNode>(), 32);
+        assert_eq!(core::mem::align_of::<AstNode>(), 32);
+        assert_eq!(core::mem::align_of::<AstArena>(), 64);
+        assert_eq!(MAX_ROWS, 4096);
+        assert_eq!(core::mem::align_of::<Int64Column>(), 64);
+        assert_eq!(core::mem::align_of::<Utf8Column>(), 64);
+        assert_eq!(core::mem::align_of::<SelectionVector>(), 64);
+        assert_eq!(core::mem::align_of::<Table>(), 64);
+        assert_eq!(core::mem::align_of::<QueryResult>(), 64);
+
+        const LIVE: usize = 2050;
+        let mut values = [0i64; MAX_ROWS];
+        let mut i = 0usize;
+        while i < LIVE {
+            values[i] = (LIVE as i64) - (i as i64); // reverse ages
+            i += 1;
+        }
+        let mut sel = SelectionVector::all(LIVE);
+        Engine::filter_i64_gt(&values, &mut sel, LIVE, 2048);
+        // values[0]=2050, values[1]=2049 → kept; values[2]=2048 dropped.
+        assert_eq!(sel.mask[0], 1);
+        assert_eq!(sel.mask[1], 1);
+        assert_eq!(sel.mask[2], 0);
+
+        let mut order = [0u16; MAX_ROWS];
+        let mut order_len = 0usize;
+        Engine::sort_i64_selected(&values, &sel, LIVE, &mut order, &mut order_len);
+        assert_eq!(order_len, 2);
+        // After LSD radix: ascending ages → 2049 then 2050.
+        assert_eq!(values[order[0] as usize], 2049);
+        assert_eq!(values[order[1] as usize], 2050);
+
+        // Direct `lsd_radix_sort_ages` on a compacted window.
+        let mut direct = [0u16; MAX_ROWS];
+        direct[0] = 0;
+        direct[1] = 1;
+        lsd_radix_sort_ages(&values, &mut direct, 2);
+        assert_eq!(values[direct[0] as usize], 2049);
+        assert_eq!(values[direct[1] as usize], 2050);
+
+        // Full pipeline on 2050-row table still zero-heap on hot path.
+        let mut table = Table::new_boxed("பயனர்கள்".as_bytes());
+        let age_i = table.add_int64_column("வயது".as_bytes()).unwrap();
+        let name_i = table.add_utf8_column("பெயர்".as_bytes()).unwrap();
+        {
+            let col = table.int64_mut(age_i).unwrap();
+            let mut r = 0usize;
+            while r < LIVE {
+                col.values[r] = r as i64;
+                col.validity.set(r, true);
+                r += 1;
+            }
+        }
+        {
+            let col = table.utf8_mut(name_i).unwrap();
+            col.clear();
+            let mut r = 0usize;
+            while r < LIVE {
+                let b = [b'0' + (r % 10) as u8];
+                assert!(col.set_row(r, &b));
+                r += 1;
+            }
+        }
+        table.set_row_count(LIVE);
+        let mut cat = Catalog::new();
+        let _ = cat.register_box(table);
+        let demo_cat = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        reset_counters();
+        set_tracking(true);
+        assert!(run_query(DEMO_QUERY, &demo_cat, &mut arena, &mut out));
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0);
+        assert_eq!(out.row_count, 10);
+
+        let mut arena2 = Box::new(AstArena::new());
+        let mut out2 = QueryResult::new_boxed();
+        let q = "இருந்து பயனர்கள் | வடி வயது > 2047 | அடுக்கு வயது | எடு 10 | தேடு வயது;";
         assert!(run_query(q, &cat, &mut arena2, &mut out2));
         assert_eq!(out2.row_count, 2);
         assert_eq!(out2.int_out[0].values[0], 2048);

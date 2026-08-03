@@ -101,7 +101,7 @@ impl ColumnMeta {
 }
 
 /// Validity bitmap: 1 bit per row, packed into u64 limbs (Arrow-compatible).
-#[repr(C)]
+#[repr(C, align(64))]
 #[derive(Copy, Clone)]
 pub struct ValidityBitmap {
     pub limbs: [u64; MAX_ROWS / 64],
@@ -260,7 +260,8 @@ impl ColumnData {
 }
 
 /// In-core columnar table segment. All column buffers are inline.
-#[repr(C)]
+/// Base address locked to a 64-byte cache line for TLB-friendly scans.
+#[repr(C, align(64))]
 pub struct Table {
     pub name: ColName,
     pub col_meta: [ColumnMeta; MAX_COLUMNS],
@@ -269,6 +270,12 @@ pub struct Table {
     pub _pad: [u8; 4],
     pub columns: [ColumnData; MAX_COLUMNS],
 }
+
+const _: () = assert!(MAX_ROWS == 4096);
+const _: () = assert!(MAX_ROWS % 64 == 0);
+const _: () = assert!(MAX_ROWS % BATCH_ROWS == 0);
+const _: () = assert!(core::mem::align_of::<Int64Column>() == 64);
+const _: () = assert!(core::mem::align_of::<Utf8Column>() == 64);
 
 impl Table {
     pub fn new(name: &[u8]) -> Self {
@@ -558,6 +565,9 @@ impl SelectionVector {
         c
     }
 }
+
+const _: () = assert!(core::mem::align_of::<SelectionVector>() == 64);
+const _: () = assert!(core::mem::align_of::<Table>() == 64);
 
 /// Build the demo `பயனர்கள்` (users) table used by the integration harness.
 pub fn seed_users_table() -> Box<Table> {

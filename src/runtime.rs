@@ -22,7 +22,7 @@ pub const MAX_PROJECT: usize = 8;
 pub const UNROLL: usize = 8;
 
 /// Result of executing a pipeline: columnar projection over selected rows.
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct QueryResult {
     pub schema: [ColumnMeta; MAX_PROJECT],
     pub col_count: u16,
@@ -216,10 +216,67 @@ fn filter_i64_chunked(
 }
 
 /// Execution context: catalog + source bytes for identifier resolution.
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct Engine<'a> {
     pub catalog: &'a Catalog,
     pub src: &'a [u8],
+}
+
+/// O(N) cache-friendly LSD radix sort over selected Int64 age keys.
+///
+/// Operates on a compacted index list in `order[0..order_len]`. Uses eight
+/// 256-bucket counting passes over the unsigned key `i64 ^ sign_bit`, writing
+/// through a stack `tmp` buffer — zero heap, stable, branch-light.
+#[inline(always)]
+pub fn lsd_radix_sort_ages(
+    values: &[i64; MAX_ROWS],
+    order: &mut [u16; MAX_ROWS],
+    order_len: usize,
+) {
+    if order_len <= 1 {
+        return;
+    }
+    let mut tmp = [0u16; MAX_ROWS];
+    let mut pass = 0u32;
+    while pass < 8 {
+        let shift = pass.wrapping_mul(8);
+        let mut hist = [0u32; 256];
+        let mut j = 0usize;
+        while j < order_len {
+            let idx = order[j] as usize;
+            let key = (values[idx] as u64) ^ 0x8000_0000_0000_0000u64;
+            let bucket = ((key >> shift) & 0xFF) as usize;
+            hist[bucket] = hist[bucket].wrapping_add(1);
+            j += 1;
+        }
+        // Exclusive prefix sum — O(256) = O(1) relative to N.
+        let mut sum = 0u32;
+        let mut b = 0usize;
+        while b < 256 {
+            let c = hist[b];
+            hist[b] = sum;
+            sum = sum.wrapping_add(c);
+            b += 1;
+        }
+        // Stable scatter into tmp.
+        let mut j = 0usize;
+        while j < order_len {
+            let idx = order[j];
+            let key = (values[idx as usize] as u64) ^ 0x8000_0000_0000_0000u64;
+            let bucket = ((key >> shift) & 0xFF) as usize;
+            let dest = hist[bucket] as usize;
+            tmp[dest] = idx;
+            hist[bucket] = hist[bucket].wrapping_add(1);
+            j += 1;
+        }
+        // Copy back for next pass (fixed-width, no heap).
+        let mut j = 0usize;
+        while j < order_len {
+            order[j] = tmp[j];
+            j += 1;
+        }
+        pass = pass.wrapping_add(1);
+    }
 }
 
 impl<'a> Engine<'a> {
@@ -272,11 +329,7 @@ impl<'a> Engine<'a> {
         filter_i64_chunked(values, sel, rows, lit, CmpOp::Eq);
     }
 
-    /// Stable argsort of selected Int64 keys into `order` (row indices).
-    ///
-    /// Complexity: **O(N)** LSD radix sort over a fixed 64-bit key width
-    /// (8×256 counting passes) — cache-friendly, allocation-free, branch-light.
-    /// Selected rows are compacted first in a linear O(N) mask scan.
+    /// Compact selected rows then invoke [`lsd_radix_sort_ages`] (O(N)).
     #[inline(always)]
     pub fn sort_i64_selected(
         values: &[i64; MAX_ROWS],
@@ -295,52 +348,7 @@ impl<'a> Engine<'a> {
             *order_len += take;
             i += 1;
         }
-        let len = *order_len;
-        if len <= 1 {
-            return;
-        }
-        // Phase 1 — LSD radix sort (unsigned key = i64 ^ sign-bit).
-        let mut tmp = [0u16; MAX_ROWS];
-        let mut pass = 0u32;
-        while pass < 8 {
-            let shift = pass.wrapping_mul(8);
-            let mut hist = [0u32; 256];
-            let mut j = 0usize;
-            while j < len {
-                let idx = order[j] as usize;
-                let key = (values[idx] as u64) ^ 0x8000_0000_0000_0000u64;
-                let bucket = ((key >> shift) & 0xFF) as usize;
-                hist[bucket] = hist[bucket].wrapping_add(1);
-                j += 1;
-            }
-            // Exclusive prefix sum — O(256) = O(1) relative to N.
-            let mut sum = 0u32;
-            let mut b = 0usize;
-            while b < 256 {
-                let c = hist[b];
-                hist[b] = sum;
-                sum = sum.wrapping_add(c);
-                b += 1;
-            }
-            // Stable scatter into tmp.
-            let mut j = 0usize;
-            while j < len {
-                let idx = order[j];
-                let key = (values[idx as usize] as u64) ^ 0x8000_0000_0000_0000u64;
-                let bucket = ((key >> shift) & 0xFF) as usize;
-                let dest = hist[bucket] as usize;
-                tmp[dest] = idx;
-                hist[bucket] = hist[bucket].wrapping_add(1);
-                j += 1;
-            }
-            // Copy back for next pass (fixed-width memcpy, no heap).
-            let mut j = 0usize;
-            while j < len {
-                order[j] = tmp[j];
-                j += 1;
-            }
-            pass = pass.wrapping_add(1);
-        }
+        lsd_radix_sort_ages(values, order, *order_len);
     }
 
     /// Apply TAKE: truncate selection / order to at most `limit` rows.
@@ -352,6 +360,7 @@ impl<'a> Engine<'a> {
         }
     }
 
+    #[inline(always)]
     fn apply_filter(
         &self,
         table: &Table,

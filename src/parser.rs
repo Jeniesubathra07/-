@@ -83,26 +83,31 @@ pub enum NodeKind {
     Empty = 14,
 }
 
-/// Flat AST node — 32 bytes, half a cache line; pairs pack cleanly into 64 B.
-#[repr(C)]
+/// Flat AST node — packed to exactly one half-cache-line (32 B) with
+/// `align(32)` so adjacent nodes never share a false-sharing boundary.
+/// Field order places `value: i64` at offset 24 to avoid internal padding.
+#[repr(C, align(32))]
 #[derive(Copy, Clone, Debug)]
 pub struct AstNode {
     pub kind: NodeKind,
     pub op: TokenKind,
     pub _pad: [u8; 2],
-    /// Source token span start (byte offset) or literal payload when kind=Literal.
+    /// Source token span start (byte offset).
     pub start: u32,
-    /// Source token span end, or high bits of literal when packed.
+    /// Source token span end.
     pub end: u32,
-    /// Integer payload (limit, literal value).
-    pub value: i64,
     /// First child / left operand index.
     pub left: u32,
     /// Second child / right operand index.
     pub right: u32,
     /// Next sibling in a list (column lists, pipeline stages).
     pub next: u32,
+    /// Integer payload (limit, literal value) — last for 8-byte align at off 24.
+    pub value: i64,
 }
+
+const _: () = assert!(core::mem::size_of::<AstNode>() == 32);
+const _: () = assert!(core::mem::align_of::<AstNode>() == 32);
 
 impl AstNode {
     #[inline(always)]
@@ -113,16 +118,16 @@ impl AstNode {
             _pad: [0; 2],
             start: 0,
             end: 0,
-            value: 0,
             left: NIL,
             right: NIL,
             next: NIL,
+            value: 0,
         }
     }
 }
 
-/// Fixed-capacity arena holding the entire query AST.
-#[repr(C)]
+/// Fixed-capacity arena holding the entire query AST (64-byte aligned base).
+#[repr(C, align(64))]
 pub struct AstArena {
     pub nodes: [AstNode; AST_CAP],
     pub len: u32,
