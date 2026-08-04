@@ -1,0 +1,27 @@
+[package]
+name = "tamil_query_engine"
+version = "0.1.0"
+edition = "2021"
+description = "Microsecond-scale Tamil-native linear pipeline vector query engine and columnar database"
+license = "MIT"
+rust-version = "1.70"
+
+[lib]
+name = "tamil_query_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tamil_query_engine"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+
+[dev-dependencies]
