@@ -427,10 +427,33 @@ impl<'a> Parser<'a> {
     fn parse_derive(&mut self, arena: &mut AstArena) -> Result<u32, ParserError> {
         self.expect(TokenKind::Kani)?;
         let col_tok = self.expect(TokenKind::Ident)?;
-        let col = self.alloc_ident(arena, col_tok)?;
+        let target = self.alloc_ident(arena, col_tok)?;
         self.expect(TokenKind::Eq)?;
-        let lit_tok = self.expect(TokenKind::Number)?;
-        let lit = self.alloc_literal(arena, lit_tok)?;
+        // RHS: <ident|number> [<*|+|-> <ident|number>]
+        let lhs = self.parse_derive_primary(arena)?;
+        let peek = self.peek().kind;
+        let is_arith = matches!(
+            peek,
+            TokenKind::Star | TokenKind::Plus | TokenKind::Minus
+        );
+        let expr = if is_arith {
+            let op_tok = self.bump();
+            let rhs = self.parse_derive_primary(arena)?;
+            arena.try_alloc(AstNode {
+                kind: NodeKind::BinOp,
+                op: op_tok.kind,
+                _pad: [0; 2],
+                start: op_tok.start,
+                end: op_tok.end,
+                value: 0,
+                left: lhs,
+                right: rhs,
+                next: NIL,
+            })?
+        } else {
+            // Bare literal / column assignment: wrap as identity add 0 via literal node.
+            lhs
+        };
         arena.try_alloc(AstNode {
             kind: NodeKind::Derive,
             op: TokenKind::Kani,
@@ -438,10 +461,26 @@ impl<'a> Parser<'a> {
             start: 0,
             end: 0,
             value: 0,
-            left: col,
-            right: lit,
+            left: target,
+            right: expr,
             next: NIL,
         })
+    }
+
+    #[inline(always)]
+    fn parse_derive_primary(&mut self, arena: &mut AstArena) -> Result<u32, ParserError> {
+        let t = self.peek();
+        match t.kind {
+            TokenKind::Ident => {
+                let tok = self.bump();
+                self.alloc_ident(arena, tok)
+            }
+            TokenKind::Number => {
+                let tok = self.bump();
+                self.alloc_literal(arena, tok)
+            }
+            _ => Err(ParserError::UnexpectedToken),
+        }
     }
 
     fn parse_group(&mut self, arena: &mut AstArena) -> Result<u32, ParserError> {

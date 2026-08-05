@@ -20,8 +20,8 @@ pub mod utf8;
 
 pub use lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
 pub use runtime::{
-    demo_catalog, lsd_radix_sort_ages, run_query, vector_merge_join, Engine, QueryResult,
-    RuntimeScratch,
+    demo_catalog, execute_chunk_parallel, lsd_radix_sort_ages, run_query, vector_merge_join,
+    ArithOp, ChunkScratch, Engine, QueryResult, RuntimeScratch,
 };
 pub use storage::{
     seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColName, ColumnData,
@@ -936,5 +936,102 @@ mod e2e_tests {
             lex.next_token().unwrap_err(),
             LexerError::MalformedUtf8(0)
         );
+    }
+
+    /// INF-STAGE3: `கணி` arithmetic derive + filter on derived column, zero heap.
+    #[test]
+    fn test_derive_math_pipeline_evaluation() {
+        let q = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | கணி புதிய_விலை = விலை * 2 | வடி புதிய_விலை > 200;";
+
+        // Lexer must emit Kani + Star for the derive assignment.
+        let mut lex = Lexer::new(q.as_bytes());
+        let mut saw_kani = false;
+        let mut saw_star = false;
+        loop {
+            match lex.next_token() {
+                Ok(t) if t.kind == TokenKind::Eof => break,
+                Ok(t) if t.kind == TokenKind::Kani => {
+                    assert_eq!(t.text(q.as_bytes()), Some("கணி"));
+                    saw_kani = true;
+                }
+                Ok(t) if t.kind == TokenKind::Star => saw_star = true,
+                Ok(_) => {}
+                Err(e) => panic!("lex fault: {e:?}"),
+            }
+        }
+        assert!(saw_kani);
+        assert!(saw_star);
+
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        reset_counters();
+        set_tracking(true);
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0, "derive hot path must not allocate");
+        assert_eq!(scratch.has_derived, 1);
+        assert_eq!(scratch.derived_name.as_bytes(), "புதிய_விலை".as_bytes());
+        // price*2 > 200 ⇒ price > 100; seeded 100 drops → 11 rows.
+        assert_eq!(out.col_count, 1);
+        assert_eq!(out.row_count, 11);
+        let mut i = 0usize;
+        while i < out.row_count as usize {
+            assert!(out.int_out[0].values[i] > 200);
+            assert_eq!(out.int_out[0].values[i] % 2, 0);
+            i += 1;
+        }
+    }
+
+    /// INF-STAGE3: chunk-parallel derive integrity across 2050 rows + Tamil query.
+    #[test]
+    fn test_parallel_chunk_distribution_integrity() {
+        // --- A: 2050-row chunk router (2 full batches + 2-row residue) ---
+        const LIVE: usize = 2050;
+        let mut src = RuntimeScratch::new_boxed();
+        let mut dst = RuntimeScratch::new_boxed();
+        let mut i = 0usize;
+        while i < LIVE {
+            src.key_buf[i] = (i as i64) + 1;
+            i += 1;
+        }
+        execute_chunk_parallel(&src.key_buf, &mut dst.derived, LIVE, ArithOp::Mul, 2);
+        let mut i = 0usize;
+        while i < LIVE {
+            assert_eq!(dst.derived[i], src.key_buf[i].wrapping_mul(2), "row {i}");
+            i += 1;
+        }
+        // Residue rows after two 1024 batches.
+        assert_eq!(dst.derived[2048], 2049 * 2);
+        assert_eq!(dst.derived[2049], 2050 * 2);
+
+        // Add path on a single partial chunk (no thread spawn → zero heap).
+        let mut out_add = RuntimeScratch::new_boxed();
+        execute_chunk_parallel(&src.key_buf, &mut out_add.derived, 17, ArithOp::Add, 5);
+        assert_eq!(out_add.derived[0], 6);
+        assert_eq!(out_add.derived[16], 22);
+
+        // --- B: full Tamil derive pipeline, zero hot-path heap ---
+        let q = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | கணி புதிய_விலை = விலை * 2 | வடி புதிய_விலை > 200;";
+        let catalog = demo_catalog();
+        assert!(catalog.orders.is_some());
+        let orders = catalog.orders.as_ref().unwrap();
+        assert_eq!(core::mem::align_of_val(orders.as_ref()), 64);
+        // derived_prices layout slot present on FixedOrdersDatabase.
+        assert_eq!(orders.derived_prices[0], orders.price_column[0]);
+
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        reset_counters();
+        set_tracking(true);
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0);
+        assert_eq!(out.row_count, 11);
+        assert!(out.int_out[0].values[0] > 200);
     }
 }

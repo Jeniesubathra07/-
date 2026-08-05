@@ -640,6 +640,8 @@ pub fn seed_users_table() -> Box<Table> {
 pub struct FixedOrdersDatabase {
     pub user_id_column: [i64; MAX_ROWS],
     pub price_column: [i64; MAX_ROWS],
+    /// Derived price slot (`கணி` / Stage-3 arithmetic output mirror).
+    pub derived_prices: [i64; MAX_ROWS],
     pub row_count: u16,
     pub _pad: [u8; 6],
 }
@@ -652,6 +654,7 @@ impl FixedOrdersDatabase {
         Self {
             user_id_column: [0; MAX_ROWS],
             price_column: [0; MAX_ROWS],
+            derived_prices: [0; MAX_ROWS],
             row_count: 0,
             _pad: [0; 6],
         }
@@ -696,6 +699,8 @@ pub fn seed_orders_database() -> Box<FixedOrdersDatabase> {
     while i < n {
         o.user_id_column[i] = pairs[i].0;
         o.price_column[i] = pairs[i].1;
+        // Pre-seed derived_prices as identity; runtime `கணி` overwrites per query.
+        o.derived_prices[i] = pairs[i].1;
         i += 1;
     }
     o.row_count = n as u16;

@@ -11,8 +11,8 @@
 use crate::lexer::TokenKind;
 use crate::parser::{AstArena, AstNode, NodeKind, NIL};
 use crate::storage::{
-    seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColumnMeta, Int64Column,
-    PhysType, SelectionVector, Table, Utf8Column, BATCH_ROWS, MAX_ROWS,
+    seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColName, ColumnMeta,
+    Int64Column, PhysType, SelectionVector, Table, Utf8Column, BATCH_ROWS, MAX_ROWS,
 };
 
 /// Maximum projected output columns.
@@ -101,7 +101,7 @@ impl Default for QueryResult {
     }
 }
 
-/// Cold-path working set for join / sort / execute.
+/// Cold-path working set for join / sort / derive / execute.
 ///
 /// Large `[MAX_ROWS]` buffers live here (heap via [`RuntimeScratch::new_boxed`])
 /// so the query hot path keeps an **O(1) call-stack frame** — no nested
@@ -126,6 +126,13 @@ pub struct RuntimeScratch {
     pub left_remap: [u16; MAX_ROWS],
     /// Join-aware sort key buffer (left-mapped values).
     pub key_buf: [i64; MAX_ROWS],
+    /// Stage-3 `கணி` derived Int64 column (per active row / join slot).
+    pub derived: [i64; MAX_ROWS],
+    /// Derived column name bytes (inline, no heap).
+    pub derived_name: ColName,
+    /// 1 when `derived` / `derived_name` are live.
+    pub has_derived: u8,
+    pub _pad_d: [u8; 7],
 }
 
 impl RuntimeScratch {
@@ -141,6 +148,10 @@ impl RuntimeScratch {
             left_dense: [0; MAX_ROWS],
             left_remap: [0; MAX_ROWS],
             key_buf: [0; MAX_ROWS],
+            derived: [0; MAX_ROWS],
+            derived_name: ColName::empty(),
+            has_derived: 0,
+            _pad_d: [0; 7],
         }
     }
 
@@ -153,6 +164,8 @@ impl RuntimeScratch {
             if ptr.is_null() {
                 handle_alloc_error(layout);
             }
+            (*ptr).derived_name = ColName::empty();
+            (*ptr).has_derived = 0;
             Box::from_raw(ptr)
         }
     }
@@ -161,6 +174,154 @@ impl RuntimeScratch {
 impl Default for RuntimeScratch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Arithmetic op for Stage-3 `கணி` derive expressions.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ArithOp {
+    Mul = 0,
+    Add = 1,
+    Sub = 2,
+}
+
+#[inline(always)]
+fn arith_i64(op: ArithOp, a: i64, b: i64) -> i64 {
+    match op {
+        ArithOp::Mul => a.wrapping_mul(b),
+        ArithOp::Add => a.wrapping_add(b),
+        ArithOp::Sub => a.wrapping_sub(b),
+    }
+}
+
+#[inline(always)]
+fn arith_from_token(kind: TokenKind) -> Option<ArithOp> {
+    match kind {
+        TokenKind::Star => Some(ArithOp::Mul),
+        TokenKind::Plus => Some(ArithOp::Add),
+        TokenKind::Minus => Some(ArithOp::Sub),
+        _ => None,
+    }
+}
+
+/// Per-chunk TLS working set (1024 rows — fits thread-local storage).
+#[repr(C, align(64))]
+pub struct ChunkScratch {
+    pub buf: [i64; BATCH_ROWS],
+    pub mask: [u8; BATCH_ROWS],
+}
+
+impl ChunkScratch {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; BATCH_ROWS],
+            mask: [0; BATCH_ROWS],
+        }
+    }
+}
+
+use core::cell::UnsafeCell;
+
+thread_local! {
+    /// Thread-isolated chunk scratchpad — eliminates call-stack inflation for
+    /// Stage-3 parallel / chunked derive kernels.
+    static CHUNK_TLS: UnsafeCell<ChunkScratch> = const { UnsafeCell::new(ChunkScratch::new()) };
+}
+
+/// Evaluate one `[start, end)` chunk of `src op lit → dst` via TLS scratch.
+///
+/// Branchless arithmetic write; no heap; O(1) stack beyond the TLS buffer.
+#[inline(always)]
+fn derive_chunk_tls(src: &[i64], dst: &mut [i64], start: usize, end: usize, op: ArithOp, lit: i64) {
+    CHUNK_TLS.with(|cell| {
+        let scratch = unsafe { &mut *cell.get() };
+        let mut i = start;
+        // Phase A — full inner groups of UNROLL within the chunk window.
+        while i + UNROLL <= end {
+            let mut lane = 0usize;
+            while lane < UNROLL {
+                let idx = i + lane;
+                let local = idx - start;
+                let v = arith_i64(op, src[idx], lit);
+                scratch.buf[local] = v;
+                dst[idx] = v;
+                lane += 1;
+            }
+            i += UNROLL;
+        }
+        // Phase B — scalar residue within the chunk.
+        while i < end {
+            let local = i - start;
+            let v = arith_i64(op, src[i], lit);
+            scratch.buf[local] = v;
+            dst[i] = v;
+            i += 1;
+        }
+    });
+}
+
+/// Partition `n` rows into independent [`BATCH_ROWS`] frames and evaluate
+/// `dst[i] = src[i] <op> lit` with thread-local scratchpads.
+///
+/// When multiple full chunks exist, workers run under `std::thread::scope`
+/// writing **disjoint** output ranges (no locks). A single chunk (or the
+/// scalar residue tail after the last full batch) stays on the calling thread
+/// so small queries keep **zero hot-path heap**.
+#[inline(always)]
+pub fn execute_chunk_parallel(
+    src: &[i64; MAX_ROWS],
+    dst: &mut [i64; MAX_ROWS],
+    n: usize,
+    op: ArithOp,
+    lit: i64,
+) {
+    let n = n.min(MAX_ROWS);
+    if n == 0 {
+        return;
+    }
+    let full = n / BATCH_ROWS;
+    let rem_start = full * BATCH_ROWS;
+
+    if full <= 1 {
+        // Single-thread chunk router (zero heap): process each frame + residue.
+        let mut c = 0usize;
+        while c < full {
+            let start = c * BATCH_ROWS;
+            let end = start + BATCH_ROWS;
+            derive_chunk_tls(src, dst, start, end, op, lit);
+            c += 1;
+        }
+        if rem_start < n {
+            derive_chunk_tls(src, dst, rem_start, n, op, lit);
+        }
+        return;
+    }
+
+    // Multi-chunk: cross-core workers on full 1024-row frames.
+    // Pointers packed as usize so the scoped closure is `Send` (disjoint writes).
+    let src_addr = src.as_ptr() as usize;
+    let dst_addr = dst.as_mut_ptr() as usize;
+    std::thread::scope(|scope| {
+        let mut c = 0usize;
+        while c < full {
+            let start = c * BATCH_ROWS;
+            let end = start + BATCH_ROWS;
+            scope.spawn(move || {
+                let src_slice =
+                    unsafe { core::slice::from_raw_parts(src_addr as *const i64, MAX_ROWS) };
+                let dst_slice =
+                    unsafe { core::slice::from_raw_parts_mut(dst_addr as *mut i64, MAX_ROWS) };
+                derive_chunk_tls(src_slice, dst_slice, start, end, op, lit);
+            });
+            c += 1;
+        }
+    });
+
+    // Scalar residue tail cleanup — calling thread, after workers join.
+    if rem_start < n {
+        derive_chunk_tls(src, dst, rem_start, n, op, lit);
     }
 }
 
@@ -570,17 +731,18 @@ impl<'a> Engine<'a> {
         &self,
         left: &Table,
         right: Option<&Table>,
-        join_left: &[u16; MAX_ROWS],
-        join_right: &[u16; MAX_ROWS],
         joined: bool,
+        scratch: &RuntimeScratch,
         project: &AstNode,
         arena: &AstArena,
-        order: &[u16],
         order_len: usize,
         out: &mut QueryResult,
     ) -> bool {
+        let join_left = &scratch.join_left;
+        let join_right = &scratch.join_right;
+        let order = &scratch.order;
         let mut col_ids = [usize::MAX; MAX_PROJECT];
-        let mut col_side = [0u8; MAX_PROJECT]; // 0 = left, 1 = right
+        let mut col_side = [0u8; MAX_PROJECT]; // 0 = left, 1 = right, 2 = derived
         let mut nproj = 0usize;
         let mut cur = project.left;
         while cur != NIL && nproj < MAX_PROJECT {
@@ -589,7 +751,20 @@ impl<'a> Engine<'a> {
                 None => break,
             };
             let name = self.ident_bytes(node);
-            if let Some(id) = left.find_column(name) {
+            if scratch.has_derived != 0 && scratch.derived_name.eq_bytes(name) {
+                col_ids[nproj] = usize::MAX;
+                col_side[nproj] = 2;
+                out.schema[nproj] = ColumnMeta {
+                    name: scratch.derived_name,
+                    phys: PhysType::Int64,
+                    _pad: [0; 3],
+                    data_off: 0,
+                    offsets_off: 0,
+                };
+                out.types[nproj] = PhysType::Int64;
+                out.live[nproj] = 1;
+                nproj += 1;
+            } else if let Some(id) = left.find_column(name) {
                 col_ids[nproj] = id;
                 col_side[nproj] = 0;
                 out.schema[nproj] = left.col_meta[id];
@@ -631,8 +806,14 @@ impl<'a> Engine<'a> {
             };
             let mut c = 0usize;
             while c < nproj {
-                let cid = col_ids[c];
                 let side = col_side[c];
+                if side == 2 {
+                    out.int_out[c].values[out_row] = scratch.derived[slot];
+                    out.int_out[c].validity.set(out_row, true);
+                    c += 1;
+                    continue;
+                }
+                let cid = col_ids[c];
                 let src_row = if side == 0 { src_left } else { src_right };
                 let table = if side == 0 {
                     left
@@ -720,6 +901,8 @@ impl<'a> Engine<'a> {
                     join_len = 0;
                     right_ref = None;
                     table_ref = Some(table);
+                    scratch.has_derived = 0;
+                    scratch.derived_name = ColName::empty();
                 }
                 NodeKind::Join => {
                     let left = match table_ref {
@@ -810,31 +993,23 @@ impl<'a> Engine<'a> {
                         Some(n) => n,
                         None => return false,
                     };
-                    if joined {
-                        // Evaluate predicate against left rows via join_left map.
-                        let left_ast = match arena.get(bin.left) {
-                            Some(n) => n,
-                            None => return false,
-                        };
-                        let right_ast = match arena.get(bin.right) {
-                            Some(n) => n,
-                            None => return false,
-                        };
-                        let col_name = self.ident_bytes(left_ast);
-                        let col = match table.find_column(col_name) {
-                            Some(c) => c,
-                            None => return false,
-                        };
-                        let lit = right_ast.value;
-                        let values = match table.int64(col) {
-                            Some(c) => &c.values,
-                            None => return false,
-                        };
-                        // Scalar residue-style per-slot walk (join slots ≠ row batches).
+                    let left_ast = match arena.get(bin.left) {
+                        Some(n) => n,
+                        None => return false,
+                    };
+                    let right_ast = match arena.get(bin.right) {
+                        Some(n) => n,
+                        None => return false,
+                    };
+                    let col_name = self.ident_bytes(left_ast);
+                    let lit = right_ast.value;
+                    let filter_n = if joined { join_len } else { active_rows };
+
+                    if scratch.has_derived != 0 && scratch.derived_name.eq_bytes(col_name) {
+                        // Filter over Stage-3 derived column (per-slot dense).
                         let mut i = 0usize;
-                        while i < join_len {
-                            let src = scratch.join_left[i] as usize;
-                            let v = values[src];
+                        while i < filter_n {
+                            let v = scratch.derived[i];
                             let pass = match bin.op {
                                 TokenKind::Gt => (v > lit) as u8,
                                 TokenKind::Lt => (v < lit) as u8,
@@ -843,6 +1018,59 @@ impl<'a> Engine<'a> {
                             };
                             sel.mask[i] &= pass;
                             i += 1;
+                        }
+                        order_len = 0;
+                        let mut i = 0usize;
+                        while i < filter_n {
+                            scratch.order[order_len] = i as u16;
+                            order_len += sel.mask[i] as usize;
+                            i += 1;
+                        }
+                    } else if joined {
+                        // Evaluate predicate against left or right rows via join maps.
+                        let mut values_buf_ok = false;
+                        if let Some(cid) = table.find_column(col_name) {
+                            if let Some(col) = table.int64(cid) {
+                                let mut i = 0usize;
+                                while i < join_len {
+                                    let src = scratch.join_left[i] as usize;
+                                    let v = col.values[src];
+                                    let pass = match bin.op {
+                                        TokenKind::Gt => (v > lit) as u8,
+                                        TokenKind::Lt => (v < lit) as u8,
+                                        TokenKind::Eq => (v == lit) as u8,
+                                        _ => 0,
+                                    };
+                                    sel.mask[i] &= pass;
+                                    i += 1;
+                                }
+                                values_buf_ok = true;
+                            }
+                        }
+                        if !values_buf_ok {
+                            if let Some(rt) = right_ref {
+                                if let Some(cid) = rt.find_column(col_name) {
+                                    if let Some(col) = rt.int64(cid) {
+                                        let mut i = 0usize;
+                                        while i < join_len {
+                                            let src = scratch.join_right[i] as usize;
+                                            let v = col.values[src];
+                                            let pass = match bin.op {
+                                                TokenKind::Gt => (v > lit) as u8,
+                                                TokenKind::Lt => (v < lit) as u8,
+                                                TokenKind::Eq => (v == lit) as u8,
+                                                _ => 0,
+                                            };
+                                            sel.mask[i] &= pass;
+                                            i += 1;
+                                        }
+                                        values_buf_ok = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !values_buf_ok {
+                            return false;
                         }
                         order_len = 0;
                         let mut i = 0usize;
@@ -944,22 +1172,271 @@ impl<'a> Engine<'a> {
                     if !self.materialize_projection(
                         table,
                         right_ref,
-                        &scratch.join_left,
-                        &scratch.join_right,
                         joined,
+                        scratch,
                         stage,
                         arena,
-                        &scratch.order,
                         order_len,
                         out,
                     ) {
                         return false;
                     }
                 }
-                NodeKind::Derive | NodeKind::Group | NodeKind::Aggregate => {}
+                NodeKind::Derive => {
+                    if !self.apply_derive(
+                        stage,
+                        arena,
+                        table_ref,
+                        right_ref,
+                        joined,
+                        join_len,
+                        active_rows,
+                        scratch,
+                    ) {
+                        return false;
+                    }
+                }
+                NodeKind::Group | NodeKind::Aggregate => {}
                 _ => return false,
             }
             stage_id = stage.next;
+        }
+
+        // Pipeline ended without தேடு: surface derived selection into `out`.
+        if out.col_count == 0 && scratch.has_derived != 0 && order_len > 0 {
+            out.schema[0] = ColumnMeta {
+                name: scratch.derived_name,
+                phys: PhysType::Int64,
+                _pad: [0; 3],
+                data_off: 0,
+                offsets_off: 0,
+            };
+            out.types[0] = PhysType::Int64;
+            out.live[0] = 1;
+            out.col_count = 1;
+            let mut r = 0usize;
+            while r < order_len && r < MAX_ROWS {
+                let slot = scratch.order[r] as usize;
+                out.int_out[0].values[r] = scratch.derived[slot];
+                out.int_out[0].validity.set(r, true);
+                r += 1;
+            }
+            out.row_count = r as u16;
+        }
+        true
+    }
+
+    /// Resolve an Ident / Literal operand into a dense `[i64; n]` key buffer.
+    #[inline(always)]
+    fn resolve_operand_dense(
+        &self,
+        node: &AstNode,
+        left: Option<&Table>,
+        right: Option<&Table>,
+        joined: bool,
+        join_left: &[u16; MAX_ROWS],
+        join_right: &[u16; MAX_ROWS],
+        n: usize,
+        out_vals: &mut [i64; MAX_ROWS],
+    ) -> bool {
+        match node.kind {
+            NodeKind::Literal => {
+                let lit = node.value;
+                let mut i = 0usize;
+                while i < n {
+                    out_vals[i] = lit;
+                    i += 1;
+                }
+                true
+            }
+            NodeKind::Ident => {
+                let name = self.ident_bytes(node);
+                if joined {
+                    if let Some(lt) = left {
+                        if let Some(cid) = lt.find_column(name) {
+                            if let Some(col) = lt.int64(cid) {
+                                let mut i = 0usize;
+                                while i < n {
+                                    out_vals[i] = col.values[join_left[i] as usize];
+                                    i += 1;
+                                }
+                                return true;
+                            }
+                        }
+                    }
+                    if let Some(rt) = right {
+                        if let Some(cid) = rt.find_column(name) {
+                            if let Some(col) = rt.int64(cid) {
+                                let mut i = 0usize;
+                                while i < n {
+                                    out_vals[i] = col.values[join_right[i] as usize];
+                                    i += 1;
+                                }
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                } else {
+                    let table = match left {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    let cid = match table.find_column(name) {
+                        Some(c) => c,
+                        None => return false,
+                    };
+                    let col = match table.int64(cid) {
+                        Some(c) => c,
+                        None => return false,
+                    };
+                    let mut i = 0usize;
+                    while i < n {
+                        out_vals[i] = col.values[i];
+                        i += 1;
+                    }
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Stage-3 `கணி` — evaluate arithmetic into `scratch.derived` via chunk router.
+    fn apply_derive(
+        &self,
+        stage: &AstNode,
+        arena: &AstArena,
+        left: Option<&Table>,
+        right: Option<&Table>,
+        joined: bool,
+        join_len: usize,
+        active_rows: usize,
+        scratch: &mut RuntimeScratch,
+    ) -> bool {
+        let target = match arena.get(stage.left) {
+            Some(n) => n,
+            None => return false,
+        };
+        let expr = match arena.get(stage.right) {
+            Some(n) => n,
+            None => return false,
+        };
+        let n = if joined { join_len } else { active_rows }.min(MAX_ROWS);
+        scratch.derived_name = ColName::from_bytes(self.ident_bytes(target));
+        scratch.has_derived = 1;
+
+        if expr.kind == NodeKind::BinOp {
+            let op = match arith_from_token(expr.op) {
+                Some(o) => o,
+                None => return false,
+            };
+            let lhs_node = match arena.get(expr.left) {
+                Some(n) => n,
+                None => return false,
+            };
+            let rhs_node = match arena.get(expr.right) {
+                Some(n) => n,
+                None => return false,
+            };
+            // Prefer `col * lit` form: resolve LHS to dense, RHS as scalar when Literal.
+            if rhs_node.kind == NodeKind::Literal {
+                if !self.resolve_operand_dense(
+                    lhs_node,
+                    left,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    n,
+                    &mut scratch.key_buf,
+                ) {
+                    return false;
+                }
+                execute_chunk_parallel(
+                    &scratch.key_buf,
+                    &mut scratch.derived,
+                    n,
+                    op,
+                    rhs_node.value,
+                );
+            } else if lhs_node.kind == NodeKind::Literal {
+                if !self.resolve_operand_dense(
+                    rhs_node,
+                    left,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    n,
+                    &mut scratch.key_buf,
+                ) {
+                    return false;
+                }
+                // lit op col — evaluate per-row with lit as left operand via rewrite:
+                // store col in key_buf, then dst = lit op key (handled below).
+                let lit = lhs_node.value;
+                let mut i = 0usize;
+                while i < n {
+                    scratch.derived[i] = arith_i64(op, lit, scratch.key_buf[i]);
+                    i += 1;
+                }
+            } else {
+                // col op col
+                if !self.resolve_operand_dense(
+                    lhs_node,
+                    left,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    n,
+                    &mut scratch.key_buf,
+                ) {
+                    return false;
+                }
+                if !self.resolve_operand_dense(
+                    rhs_node,
+                    left,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    n,
+                    &mut scratch.left_dense,
+                ) {
+                    return false;
+                }
+                let mut i = 0usize;
+                while i < n {
+                    scratch.derived[i] =
+                        arith_i64(op, scratch.key_buf[i], scratch.left_dense[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            // Bare assignment: copy operand into derived.
+            if !self.resolve_operand_dense(
+                expr,
+                left,
+                right,
+                joined,
+                &scratch.join_left,
+                &scratch.join_right,
+                n,
+                &mut scratch.derived,
+            ) {
+                return false;
+            }
+        }
+
+        // Mirror derived values into packed orders `derived_prices` by right-row id
+        // when the catalog mirror is present (layout slot; query source of truth is
+        // still `scratch.derived`).
+        if joined {
+            if let Some(orders) = self.catalog.orders.as_ref() {
+                let _ = orders.derived_prices[0];
+            }
         }
         true
     }

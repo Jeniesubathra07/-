@@ -71,6 +71,12 @@ pub enum TokenKind {
     Eof = 18,
     /// Lexical error sentinel
     Error = 19,
+    /// `*` — multiply (derive math)
+    Star = 20,
+    /// `+` — add (derive math)
+    Plus = 21,
+    /// `-` — subtract (derive math)
+    Minus = 22,
 }
 
 impl TokenKind {
@@ -141,6 +147,9 @@ const OP_KIND_LUT: [u8; 256] = {
     t[b'<' as usize] = TokenKind::Lt as u8;
     t[b',' as usize] = TokenKind::Comma as u8;
     t[b';' as usize] = TokenKind::Semi as u8;
+    t[b'*' as usize] = TokenKind::Star as u8;
+    t[b'+' as usize] = TokenKind::Plus as u8;
+    t[b'-' as usize] = TokenKind::Minus as u8;
     t
 };
 
@@ -319,6 +328,9 @@ impl<'a> Lexer<'a> {
             x if x == TokenKind::Lt as u8 => TokenKind::Lt,
             x if x == TokenKind::Comma as u8 => TokenKind::Comma,
             x if x == TokenKind::Semi as u8 => TokenKind::Semi,
+            x if x == TokenKind::Star as u8 => TokenKind::Star,
+            x if x == TokenKind::Plus as u8 => TokenKind::Plus,
+            x if x == TokenKind::Minus as u8 => TokenKind::Minus,
             _ => TokenKind::Error,
         };
         Token {
