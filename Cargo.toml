@@ -31,3 +31,6 @@ strip = true
 inherits = "release"
 
 [dev-dependencies]
+
+[dependencies]
+memmap2 = "0.9"

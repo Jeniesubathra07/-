@@ -20,14 +20,16 @@ pub mod utf8;
 
 pub use lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
 pub use runtime::{
-    demo_catalog, execute_chunk_parallel, execute_chunk_parallel_os, lsd_radix_sort_ages,
+    demo_catalog, execute_chunk_parallel, execute_chunk_parallel_os,
+    execute_mmap_age_filter_stream, execute_mmap_table_filter_project_stream, lsd_radix_sort_ages,
     lsd_radix_sort_ages_tls, run_query, vector_merge_join, ArithOp, ChunkScratch, Engine,
-    EngineScratchPad, QueryResult, RadixScratchPad, RuntimeScratch,
+    EngineScratchPad, MmapStreamStats, QueryResult, RadixScratchPad, RuntimeScratch,
 };
 pub use storage::{
-    seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColName, ColumnData,
-    FixedOrdersDatabase, Int64Column, PhysType, SelectionVector, Table, Utf8Column, BATCH_ROWS,
-    MAX_ROWS,
+    seed_orders_database, seed_orders_table, seed_users_table, write_i64_column_bin,
+    write_stage4_columnar_demo, Catalog, ColName, ColumnData, ColumnarChunk, ColumnarFileStream,
+    ColumnarTablePage, ColumnarTableStream, FixedOrdersDatabase, Int64Column, PhysType,
+    SelectionVector, Table, Utf8Column, BATCH_ROWS, MAX_ROWS,
 };
 pub use parser::{
     alloc_token_window, parse_query, AstArena, AstNode, NodeKind, OpKind, ParseError, Parser, ParserError, AST_CAP, NIL,
@@ -1559,5 +1561,101 @@ mod e2e_tests {
             s += 1;
         }
         assert!(found, "derived slab must hold computed *mut i64 values");
+    }
+
+    /// STAGE-4: mmap columnar page stream over 10_000 rows (2×4096 + 1808 residue).
+    #[test]
+    fn test_persistent_mmap_page_streaming_fidelity() {
+        const TOTAL: usize = 10_000;
+        assert_eq!(TOTAL / MAX_ROWS, 2);
+        assert_eq!(TOTAL % MAX_ROWS, 1808);
+
+        let dir = std::env::temp_dir().join("tamil_stage4_mmap_fidelity");
+        let _ = std::fs::create_dir_all(&dir);
+        write_stage4_columnar_demo(&dir, TOTAL).expect("write columnar bins");
+
+        // --- A: single-column ages stream page geometry ---
+        let ages_path = dir.join("ages.bin");
+        let mut ages = ColumnarFileStream::open_i64(&ages_path).expect("mmap ages");
+        assert_eq!(ages.total_rows(), TOTAL as u64);
+
+        let p0 = ages.next_page_chunk().expect("page0");
+        assert_eq!(p0.page_index, 0);
+        assert_eq!(p0.row_count as usize, MAX_ROWS);
+        assert_eq!(p0.is_residue, 0);
+        assert_eq!(p0.rows.len(), MAX_ROWS);
+
+        let p1 = ages.next_page_chunk().expect("page1");
+        assert_eq!(p1.page_index, 1);
+        assert_eq!(p1.row_count as usize, MAX_ROWS);
+        assert_eq!(p1.is_residue, 0);
+
+        let p2 = ages.next_page_chunk().expect("residue");
+        assert_eq!(p2.page_index, 2);
+        assert_eq!(p2.row_count as usize, 1808);
+        assert_eq!(p2.is_residue, 1);
+        assert_eq!(p2.rows.len(), 1808);
+        assert!(ages.next_page_chunk().is_none());
+
+        // --- B: stream filter+derive via TLS pads — zero hot-path heap ---
+        let mut ages2 = ColumnarFileStream::open_i64(&ages_path).expect("mmap ages2");
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut stats = MmapStreamStats::default();
+        reset_counters();
+        set_tracking(true);
+        let t0 = std::time::Instant::now();
+        execute_mmap_age_filter_stream(&mut ages2, 21, 2, &mut scratch, &mut stats);
+        let elapsed = t0.elapsed();
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0, "mmap page loop must not allocate");
+        assert_eq!(stats.pages_full, 2);
+        assert_eq!(stats.pages_residue, 1);
+        assert_eq!(stats.residue_rows, 1808);
+        assert_eq!(stats.rows_scanned, TOTAL as u64);
+        // ages = 18 + (i % 40); kept when > 21.
+        assert!(stats.rows_kept > 0);
+        assert!(stats.rows_kept < stats.rows_scanned);
+        // Sub-microsecond per-row budget envelope (coarse wall check on page router).
+        let ns_per_row = elapsed.as_nanos() / (TOTAL as u128);
+        assert!(
+            ns_per_row < 5_000,
+            "per-row mmap path too slow: {ns_per_row} ns"
+        );
+
+        // --- C: multi-column lockstep table stream ---
+        let mut table = ColumnarTableStream::open(
+            &dir.join("user_ids.bin"),
+            &dir.join("ages.bin"),
+            &dir.join("prices.bin"),
+        )
+        .expect("open table stream");
+        assert_eq!(table.total_rows(), TOTAL as u64);
+        let mut out_prices = [0i64; 64];
+        let mut out_len = 0usize;
+        let mut stats2 = MmapStreamStats::default();
+        let mut scratch2 = RuntimeScratch::new_boxed();
+        reset_counters();
+        set_tracking(true);
+        execute_mmap_table_filter_project_stream(
+            &mut table,
+            21,
+            &mut scratch2,
+            &mut stats2,
+            &mut out_prices,
+            &mut out_len,
+        );
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0);
+        assert_eq!(stats2.pages_full, 2);
+        assert_eq!(stats2.pages_residue, 1);
+        assert_eq!(stats2.residue_rows, 1808);
+        assert_eq!(stats2.rows_scanned, TOTAL as u64);
+        assert!(out_len > 0);
+        assert!(out_len <= 64);
+        let mut k = 0usize;
+        while k < out_len {
+            assert!(out_prices[k] >= 100);
+            k += 1;
+        }
     }
 }

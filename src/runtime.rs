@@ -1622,6 +1622,143 @@ pub fn run_query(
     engine.execute(arena, out, scratch)
 }
 
+/// Stage-4 mmap stream statistics (flat POD — no heap).
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MmapStreamStats {
+    pub pages_full: u32,
+    pub pages_residue: u32,
+    pub residue_rows: u32,
+    pub rows_scanned: u64,
+    pub rows_kept: u64,
+    pub _pad: [u8; 28],
+}
+
+/// Copy a zero-copy mmap page into `dst[0..n]` (fixed scratch — no heap).
+#[inline(always)]
+fn copy_page_to_scratch(src: &[i64], dst: &mut [i64; MAX_ROWS], n: usize) {
+    let n = n.min(src.len()).min(MAX_ROWS);
+    let mut i = 0usize;
+    while i < n {
+        dst[i] = src[i];
+        i += 1;
+    }
+}
+
+/// Infinite-stream compute router: feed mmap pages through TLS chunk kernels.
+///
+/// For each [`MAX_ROWS`] page (or EOF residue):
+/// 1. memcpy page → `scratch.key_buf` (recycles resident buffers)
+/// 2. vectorized filter `ages > lit`
+/// 3. optional `execute_chunk_parallel` derive (`* factor`) into `scratch.derived`
+/// 4. accumulate kept-row count into `stats` (no output heap growth)
+///
+/// Hot path: zero `alloc` after streams are opened.
+#[inline(always)]
+pub fn execute_mmap_age_filter_stream(
+    stream: &mut crate::storage::ColumnarFileStream,
+    age_gt: i64,
+    derive_mul: i64,
+    scratch: &mut RuntimeScratch,
+    stats: &mut MmapStreamStats,
+) {
+    *stats = MmapStreamStats::default();
+    stream.rewind();
+    loop {
+        let page = match stream.next_page_chunk() {
+            Some(p) => p,
+            None => break,
+        };
+        let n = page.row_count as usize;
+        if page.is_residue != 0 {
+            stats.pages_residue = stats.pages_residue.wrapping_add(1);
+            stats.residue_rows = n as u32;
+        } else {
+            stats.pages_full = stats.pages_full.wrapping_add(1);
+        }
+        stats.rows_scanned = stats.rows_scanned.wrapping_add(n as u64);
+
+        copy_page_to_scratch(page.rows, &mut scratch.key_buf, n);
+        let mut sel = SelectionVector::all(n);
+        Engine::filter_i64_gt(&scratch.key_buf, &mut sel, n, age_gt);
+        execute_chunk_parallel(
+            &scratch.key_buf,
+            &mut scratch.derived,
+            n,
+            ArithOp::Mul,
+            derive_mul,
+        );
+
+        let mut kept = 0u64;
+        let mut i = 0usize;
+        while i < n {
+            kept = kept.wrapping_add(sel.mask[i] as u64);
+            i += 1;
+        }
+        stats.rows_kept = stats.rows_kept.wrapping_add(kept);
+    }
+}
+
+/// Multi-column mmap stream: filter ages, project prices for kept rows into `out_prices`.
+///
+/// `out_prices` / `out_len` are caller-provided fixed buffers (cap = [`MAX_ROWS`] kept
+/// spill for the **last** page only is insufficient for full 10k — we accumulate a
+/// running count and write up to `out_cap` samples for fidelity checks).
+#[inline(always)]
+pub fn execute_mmap_table_filter_project_stream(
+    table: &mut crate::storage::ColumnarTableStream,
+    age_gt: i64,
+    scratch: &mut RuntimeScratch,
+    stats: &mut MmapStreamStats,
+    out_prices: &mut [i64],
+    out_len: &mut usize,
+) {
+    *stats = MmapStreamStats::default();
+    *out_len = 0;
+    table.rewind();
+    let out_cap = out_prices.len();
+    loop {
+        let page = match table.next_page() {
+            Some(p) => p,
+            None => break,
+        };
+        let n = page.row_count as usize;
+        if page.is_residue != 0 {
+            stats.pages_residue = stats.pages_residue.wrapping_add(1);
+            stats.residue_rows = n as u32;
+        } else {
+            stats.pages_full = stats.pages_full.wrapping_add(1);
+        }
+        stats.rows_scanned = stats.rows_scanned.wrapping_add(n as u64);
+
+        copy_page_to_scratch(page.ages, &mut scratch.key_buf, n);
+        let mut sel = SelectionVector::all(n);
+        Engine::filter_i64_gt(&scratch.key_buf, &mut sel, n, age_gt);
+
+        // Derive prices * 1 into derived via chunk router (exercises TLS pads).
+        copy_page_to_scratch(page.prices, &mut scratch.left_dense, n);
+        execute_chunk_parallel(
+            &scratch.left_dense,
+            &mut scratch.derived,
+            n,
+            ArithOp::Mul,
+            1,
+        );
+
+        let mut i = 0usize;
+        while i < n {
+            if sel.mask[i] != 0 {
+                stats.rows_kept = stats.rows_kept.wrapping_add(1);
+                if *out_len < out_cap {
+                    out_prices[*out_len] = scratch.derived[i];
+                    *out_len += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

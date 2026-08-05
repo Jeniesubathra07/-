@@ -745,6 +745,303 @@ pub unsafe fn memcpy_bytes(dst: *mut u8, src: *const u8, len: usize) {
     unsafe { ptr::copy_nonoverlapping(src, dst, len) }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Stage-4 — zero-allocation columnar disk persistence (mmap page stream)
+// ═══════════════════════════════════════════════════════════════════════════
+
+use memmap2::Mmap;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
+
+/// One memory-mapped page window over an Int64 column file.
+///
+/// `rows` is a direct view into the mmap — **no copy, no heap**.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ColumnarChunk<'a> {
+    pub rows: &'a [i64],
+    pub row_count: u16,
+    pub page_index: u32,
+    /// 1 when `row_count < MAX_ROWS` (EOF residue tail).
+    pub is_residue: u8,
+    pub _pad: [u8; 1],
+}
+
+impl<'a> ColumnarChunk<'a> {
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self {
+            rows: &[],
+            row_count: 0,
+            page_index: 0,
+            is_residue: 0,
+            _pad: [0; 1],
+        }
+    }
+}
+
+/// Zero-allocation Int64 columnar file stream via OS virtual memory map.
+///
+/// Cold path: `open` / file create. Hot path: [`ColumnarFileStream::next_page_chunk`]
+/// advances raw pointer offsets by exactly [`MAX_ROWS`] (or the EOF residue).
+#[repr(C)]
+pub struct ColumnarFileStream {
+    /// OS mmap of the entire `.bin` column file (cold-owned mapping object).
+    map: Mmap,
+    /// Total Int64 rows in the file (`map.len() / 8`).
+    total_rows: u64,
+    /// Next row index to yield.
+    cursor_row: u64,
+    /// Pages already yielded.
+    page_index: u32,
+    pub _pad: [u8; 4],
+}
+
+impl ColumnarFileStream {
+    /// Cold-path: open + mmap an Int64 `.bin` column file (little-endian packed).
+    pub fn open_i64(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let meta = file.metadata()?;
+        let len = meta.len() as usize;
+        if len % core::mem::size_of::<i64>() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "i64 column file length not multiple of 8",
+            ));
+        }
+        // SAFETY: file is opened read-only; length validated.
+        let map = unsafe { Mmap::map(&file)? };
+        let total_rows = (len / core::mem::size_of::<i64>()) as u64;
+        Ok(Self {
+            map,
+            total_rows,
+            cursor_row: 0,
+            page_index: 0,
+            _pad: [0; 4],
+        })
+    }
+
+    #[inline(always)]
+    pub fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    #[inline(always)]
+    pub fn cursor_row(&self) -> u64 {
+        self.cursor_row
+    }
+
+    #[inline(always)]
+    pub fn pages_emitted(&self) -> u32 {
+        self.page_index
+    }
+
+    /// Rewind to the first page (no remapping / no alloc).
+    #[inline(always)]
+    pub fn rewind(&mut self) {
+        self.cursor_row = 0;
+        self.page_index = 0;
+    }
+
+    /// Yield the next [`MAX_ROWS`]-capped page as a zero-copy mmap window.
+    ///
+    /// Returns `None` at EOF. Residue pages set `is_residue = 1` and carry
+    /// `1..MAX_ROWS` rows (e.g. 1808 after two full 4096 pages of a 10000-row file).
+    #[inline(always)]
+    pub fn next_page_chunk(&mut self) -> Option<ColumnarChunk<'_>> {
+        if self.cursor_row >= self.total_rows {
+            return None;
+        }
+        let remaining = (self.total_rows - self.cursor_row) as usize;
+        let n = if remaining > MAX_ROWS {
+            MAX_ROWS
+        } else {
+            remaining
+        };
+        let byte_off = (self.cursor_row as usize).wrapping_mul(8);
+        let byte_len = n.wrapping_mul(8);
+        let end = byte_off.wrapping_add(byte_len);
+        if end > self.map.len() {
+            return None;
+        }
+        let bytes = &self.map[byte_off..end];
+        // SAFETY: length is a multiple of 8; mmap base is page-aligned; i64 view
+        // is valid for `n` elements within the mapped region.
+        let rows: &[i64] = unsafe {
+            core::slice::from_raw_parts(bytes.as_ptr() as *const i64, n)
+        };
+        let is_residue = (n < MAX_ROWS) as u8;
+        let page_index = self.page_index;
+        self.cursor_row = self.cursor_row.wrapping_add(n as u64);
+        self.page_index = self.page_index.wrapping_add(1);
+        Some(ColumnarChunk {
+            rows,
+            row_count: n as u16,
+            page_index,
+            is_residue,
+            _pad: [0; 1],
+        })
+    }
+}
+
+/// Multi-column mmap table: independent `.bin` files per physical column.
+///
+/// Hot path advances all streams in lockstep via [`ColumnarTableStream::next_page`].
+#[repr(C)]
+pub struct ColumnarTableStream {
+    pub user_ids: ColumnarFileStream,
+    pub ages: ColumnarFileStream,
+    pub prices: ColumnarFileStream,
+}
+
+/// One lockstep multi-column page (zero-copy views).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ColumnarTablePage<'a> {
+    pub user_ids: &'a [i64],
+    pub ages: &'a [i64],
+    pub prices: &'a [i64],
+    pub row_count: u16,
+    pub page_index: u32,
+    pub is_residue: u8,
+    pub _pad: [u8; 1],
+}
+
+impl ColumnarTableStream {
+    /// Cold-path open of three Int64 column files (must share identical row counts).
+    pub fn open(user_ids: &Path, ages: &Path, prices: &Path) -> io::Result<Self> {
+        let user_ids = ColumnarFileStream::open_i64(user_ids)?;
+        let ages = ColumnarFileStream::open_i64(ages)?;
+        let prices = ColumnarFileStream::open_i64(prices)?;
+        if user_ids.total_rows != ages.total_rows || ages.total_rows != prices.total_rows {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "columnar .bin row counts diverge",
+            ));
+        }
+        Ok(Self {
+            user_ids,
+            ages,
+            prices,
+        })
+    }
+
+    #[inline(always)]
+    pub fn total_rows(&self) -> u64 {
+        self.ages.total_rows
+    }
+
+    #[inline(always)]
+    pub fn rewind(&mut self) {
+        self.user_ids.rewind();
+        self.ages.rewind();
+        self.prices.rewind();
+    }
+
+    /// Lockstep page advance — all columns share the same row window (disjoint field borrows).
+    #[inline(always)]
+    pub fn next_page(&mut self) -> Option<ColumnarTablePage<'_>> {
+        if self.ages.cursor_row >= self.ages.total_rows {
+            return None;
+        }
+        let start_row = self.ages.cursor_row as usize;
+        let remaining = (self.ages.total_rows as usize).saturating_sub(start_row);
+        let n = if remaining > MAX_ROWS {
+            MAX_ROWS
+        } else {
+            remaining
+        };
+        let byte_off = start_row.wrapping_mul(8);
+        let byte_end = byte_off.wrapping_add(n.wrapping_mul(8));
+        if byte_end > self.ages.map.len()
+            || byte_end > self.user_ids.map.len()
+            || byte_end > self.prices.map.len()
+        {
+            return None;
+        }
+        let ages = unsafe {
+            core::slice::from_raw_parts(
+                self.ages.map[byte_off..byte_end].as_ptr() as *const i64,
+                n,
+            )
+        };
+        let user_ids = unsafe {
+            core::slice::from_raw_parts(
+                self.user_ids.map[byte_off..byte_end].as_ptr() as *const i64,
+                n,
+            )
+        };
+        let prices = unsafe {
+            core::slice::from_raw_parts(
+                self.prices.map[byte_off..byte_end].as_ptr() as *const i64,
+                n,
+            )
+        };
+        let page_index = self.ages.page_index;
+        let is_residue = (n < MAX_ROWS) as u8;
+        let next_cursor = self.ages.cursor_row.wrapping_add(n as u64);
+        let next_page = self.ages.page_index.wrapping_add(1);
+        self.ages.cursor_row = next_cursor;
+        self.user_ids.cursor_row = next_cursor;
+        self.prices.cursor_row = next_cursor;
+        self.ages.page_index = next_page;
+        self.user_ids.page_index = next_page;
+        self.prices.page_index = next_page;
+        Some(ColumnarTablePage {
+            user_ids,
+            ages,
+            prices,
+            row_count: n as u16,
+            page_index,
+            is_residue,
+            _pad: [0; 1],
+        })
+    }
+}
+
+/// Cold-path: write a packed little-endian Int64 `.bin` column file.
+///
+/// Writes in [`MAX_ROWS`] stack windows — never materializes the full column as `Vec`.
+pub fn write_i64_column_bin<F>(path: &Path, total_rows: usize, mut fill: F) -> io::Result<()>
+where
+    F: FnMut(usize) -> i64,
+{
+    let mut file = File::create(path)?;
+    let mut window = [0i64; MAX_ROWS];
+    let mut written = 0usize;
+    while written < total_rows {
+        let n = (total_rows - written).min(MAX_ROWS);
+        let mut i = 0usize;
+        while i < n {
+            window[i] = fill(written + i);
+            i += 1;
+        }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                window.as_ptr() as *const u8,
+                n.wrapping_mul(core::mem::size_of::<i64>()),
+            )
+        };
+        file.write_all(bytes)?;
+        written += n;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// Cold-path: materialize Stage-4 demo columnar files under `dir`.
+///
+/// Layout: `user_ids.bin`, `ages.bin`, `prices.bin` — `total_rows` Int64 records each.
+pub fn write_stage4_columnar_demo(dir: &Path, total_rows: usize) -> io::Result<()> {
+    write_i64_column_bin(&dir.join("user_ids.bin"), total_rows, |i| (i % 16) as i64)?;
+    write_i64_column_bin(&dir.join("ages.bin"), total_rows, |i| (18 + (i % 40)) as i64)?;
+    write_i64_column_bin(&dir.join("prices.bin"), total_rows, |i| {
+        100 + (i as i64).wrapping_mul(3)
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +1055,29 @@ mod tests {
         assert_eq!(t.utf8(name).unwrap().get_row(1), Some("பிரியா"));
         assert_eq!(t.int64(age).unwrap().values[1], 22);
         assert_eq!(t.col_meta[name].name.as_bytes(), "பெயர்".as_bytes());
+    }
+
+    #[test]
+    fn columnar_file_stream_pages_10000() {
+        let dir = std::env::temp_dir().join("tamil_mmap_unit");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ages.bin");
+        write_i64_column_bin(&path, 10_000, |i| i as i64).unwrap();
+        let mut stream = ColumnarFileStream::open_i64(&path).unwrap();
+        assert_eq!(stream.total_rows(), 10_000);
+        let p0 = stream.next_page_chunk().unwrap();
+        assert_eq!(p0.row_count as usize, MAX_ROWS);
+        assert_eq!(p0.is_residue, 0);
+        assert_eq!(p0.rows[0], 0);
+        assert_eq!(p0.rows[4095], 4095);
+        let p1 = stream.next_page_chunk().unwrap();
+        assert_eq!(p1.row_count as usize, MAX_ROWS);
+        assert_eq!(p1.rows[0], 4096);
+        let p2 = stream.next_page_chunk().unwrap();
+        assert_eq!(p2.row_count as usize, 1808);
+        assert_eq!(p2.is_residue, 1);
+        assert_eq!(p2.rows[0], 8192);
+        assert_eq!(p2.rows[1807], 9999);
+        assert!(stream.next_page_chunk().is_none());
     }
 }
