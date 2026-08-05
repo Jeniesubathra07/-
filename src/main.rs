@@ -2,7 +2,10 @@
 
 use std::env;
 use std::process;
-use tamil_query_engine::{demo_catalog, run_query, AstArena, PhysType, QueryResult, DEMO_QUERY};
+use tamil_query_engine::{
+    alloc_token_window, demo_catalog, run_query, AstArena, PhysType, QueryResult,
+    RuntimeScratch, DEMO_QUERY,
+};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -14,8 +17,10 @@ fn main() {
     let catalog = demo_catalog();
     let mut arena = Box::new(AstArena::new());
     let mut out = QueryResult::new_boxed();
+    let mut scratch = RuntimeScratch::new_boxed();
+    let mut tokens = alloc_token_window();
 
-    if !run_query(&query, &catalog, &mut arena, &mut out) {
+    if !run_query(&query, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens) {
         eprintln!("error: failed to parse or execute query");
         eprintln!("query: {query}");
         process::exit(1);

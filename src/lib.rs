@@ -21,6 +21,7 @@ pub mod utf8;
 pub use lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
 pub use runtime::{
     demo_catalog, lsd_radix_sort_ages, run_query, vector_merge_join, Engine, QueryResult,
+    RuntimeScratch,
 };
 pub use storage::{
     seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColName, ColumnData,
@@ -28,7 +29,7 @@ pub use storage::{
     MAX_ROWS,
 };
 pub use parser::{
-    parse_query, AstArena, AstNode, NodeKind, OpKind, ParseError, Parser, ParserError, AST_CAP, NIL,
+    alloc_token_window, parse_query, AstArena, AstNode, NodeKind, OpKind, ParseError, Parser, ParserError, AST_CAP, NIL,
 };
 
 /// Canonical end-to-end demo query from the system specification.
@@ -102,6 +103,8 @@ mod e2e_tests {
         let catalog = demo_catalog();
         let mut arena = Box::new(AstArena::new());
         let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
 
         assert!(DEMO_QUERY.contains("தேடு"));
         assert!(DEMO_QUERY.contains("பெயர்"));
@@ -114,7 +117,7 @@ mod e2e_tests {
 
         reset_counters();
         set_tracking(true);
-        let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out);
+        let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens);
         set_tracking(false);
 
         assert!(ok, "pipeline must execute successfully");
@@ -210,7 +213,8 @@ mod e2e_tests {
         let q = DEMO_QUERY.as_bytes();
         let mut arena = AstArena::new();
         arena.len = AST_CAP as u32;
-        let err = parse_query(q, &mut arena).expect_err("saturated arena must error");
+        let mut tw = alloc_token_window();
+        let err = parse_query(q, &mut arena, &mut tw).expect_err("saturated arena must error");
         assert_eq!(err, ParserError::ArenaOverflow);
         assert!(arena.is_full());
         let again = arena.try_alloc(AstNode::empty());
@@ -263,7 +267,8 @@ mod e2e_tests {
         let the_off = full.len() - 6;
         let torn = &full[..the_off + 4];
         let mut arena = AstArena::new();
-        let err = parse_query(torn, &mut arena).expect_err("parse must surface lex fault");
+        let mut tw = alloc_token_window();
+        let err = parse_query(torn, &mut arena, &mut tw).expect_err("parse must surface lex fault");
         assert_eq!(err, ParserError::LexMalformedUtf8);
         assert_eq!(arena.root, NIL);
     }
@@ -292,7 +297,8 @@ mod e2e_tests {
         let stream = &buf[..pb.len() + 4];
 
         let mut arena = AstArena::new();
-        let err = parse_query(stream, &mut arena).expect_err("torn stream");
+        let mut tw = alloc_token_window();
+        let err = parse_query(stream, &mut arena, &mut tw).expect_err("torn stream");
         assert_eq!(err, ParserError::LexMalformedUtf8);
 
         // Maximal munch: வடிவமைப்பு must remain Ident (not keyword வடி).
@@ -314,12 +320,14 @@ mod e2e_tests {
         q.push(';');
 
         let mut arena = Box::new(AstArena::new());
-        let err = parse_query(q.as_bytes(), &mut arena).expect_err("ArenaOverflow");
+        let mut tw = alloc_token_window();
+        let err = parse_query(q.as_bytes(), &mut arena, &mut tw).expect_err("ArenaOverflow");
         assert_eq!(err, ParserError::ArenaOverflow);
 
         // Missing இருந்து source context.
         let mut arena2 = AstArena::new();
-        let err2 = parse_query("வடி வயது > 1;".as_bytes(), &mut arena2).unwrap_err();
+        let mut tw2 = alloc_token_window();
+        let err2 = parse_query("வடி வயது > 1;".as_bytes(), &mut arena2, &mut tw2).unwrap_err();
         assert_eq!(err2, ParserError::MissingSourceContext);
     }
 
@@ -376,7 +384,9 @@ mod e2e_tests {
         let q = "இருந்து பயனர்கள் | வடி வயது > 1023 | தேடு வயது;";
         let mut arena = Box::new(AstArena::new());
         let mut out = QueryResult::new_boxed();
-        assert!(run_query(q, &cat, &mut arena, &mut out));
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens));
         assert_eq!(out.row_count, 1);
         assert_eq!(out.int_out[0].values[0], 1024);
     }
@@ -407,7 +417,10 @@ mod e2e_tests {
 
         let mut arena = AstArena::new();
         assert_eq!(
-            parse_query(ws, &mut arena).unwrap_err(),
+            {
+            let mut tw = alloc_token_window();
+            parse_query(ws, &mut arena, &mut tw).unwrap_err()
+        },
             ParserError::EmptyInput
         );
 
@@ -415,9 +428,11 @@ mod e2e_tests {
         let catalog = demo_catalog();
         let mut arena = Box::new(AstArena::new());
         let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out);
+        let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens);
         set_tracking(false);
         assert!(ok);
         assert_eq!(alloc_count(), 0);
@@ -431,9 +446,11 @@ mod e2e_tests {
         let catalog = demo_catalog();
         let mut arena = Box::new(AstArena::new());
         let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        assert!(run_query(DEMO_QUERY, &catalog, &mut arena, &mut out));
+        assert!(run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
         set_tracking(false);
         assert_eq!(alloc_count(), 0);
         assert_eq!(out.row_count, 10);
@@ -464,7 +481,8 @@ mod e2e_tests {
 
         let mut order = [0u16; MAX_ROWS];
         let mut order_len = 0usize;
-        Engine::sort_i64_selected(&values, &sel, LIVE, &mut order, &mut order_len);
+        let mut tmp = [0u16; MAX_ROWS];
+        Engine::sort_i64_selected(&values, &sel, LIVE, &mut order, &mut order_len, &mut tmp);
         assert_eq!(order_len, 2);
         assert_eq!(order[0], 2048);
         assert_eq!(order[1], 2049);
@@ -498,7 +516,9 @@ mod e2e_tests {
         let q = "இருந்து பயனர்கள் | வடி வயது > 2047 | அடுக்கு வயது | எடு 10 | தேடு வயது;";
         let mut arena2 = Box::new(AstArena::new());
         let mut out2 = QueryResult::new_boxed();
-        assert!(run_query(q, &cat, &mut arena2, &mut out2));
+        let mut scratch2 = RuntimeScratch::new_boxed();
+        let mut tokens2 = alloc_token_window();
+        assert!(run_query(q, &cat, &mut arena2, &mut out2, &mut scratch2, &mut tokens2));
         assert_eq!(out2.row_count, 2);
         assert_eq!(out2.int_out[0].values[0], 2048);
         assert_eq!(out2.int_out[0].values[1], 2049);
@@ -533,7 +553,8 @@ mod e2e_tests {
 
         let mut order = [0u16; MAX_ROWS];
         let mut order_len = 0usize;
-        Engine::sort_i64_selected(&values, &sel, LIVE, &mut order, &mut order_len);
+        let mut tmp = [0u16; MAX_ROWS];
+        Engine::sort_i64_selected(&values, &sel, LIVE, &mut order, &mut order_len, &mut tmp);
         assert_eq!(order_len, 2);
         // After LSD radix: ascending ages → 2049 then 2050.
         assert_eq!(values[order[0] as usize], 2049);
@@ -543,7 +564,7 @@ mod e2e_tests {
         let mut direct = [0u16; MAX_ROWS];
         direct[0] = 0;
         direct[1] = 1;
-        lsd_radix_sort_ages(&values, &mut direct, 2);
+        lsd_radix_sort_ages(&values, &mut direct, 2, &mut tmp);
         assert_eq!(values[direct[0] as usize], 2049);
         assert_eq!(values[direct[1] as usize], 2050);
 
@@ -576,17 +597,21 @@ mod e2e_tests {
         let demo_cat = demo_catalog();
         let mut arena = Box::new(AstArena::new());
         let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        assert!(run_query(DEMO_QUERY, &demo_cat, &mut arena, &mut out));
+        assert!(run_query(DEMO_QUERY, &demo_cat, &mut arena, &mut out, &mut scratch, &mut tokens));
         set_tracking(false);
         assert_eq!(alloc_count(), 0);
         assert_eq!(out.row_count, 10);
 
         let mut arena2 = Box::new(AstArena::new());
         let mut out2 = QueryResult::new_boxed();
+        let mut scratch2 = RuntimeScratch::new_boxed();
+        let mut tokens2 = alloc_token_window();
         let q = "இருந்து பயனர்கள் | வடி வயது > 2047 | அடுக்கு வயது | எடு 10 | தேடு வயது;";
-        assert!(run_query(q, &cat, &mut arena2, &mut out2));
+        assert!(run_query(q, &cat, &mut arena2, &mut out2, &mut scratch2, &mut tokens2));
         assert_eq!(out2.row_count, 2);
         assert_eq!(out2.int_out[0].values[0], 2048);
         assert_eq!(out2.int_out[0].values[1], 2049);
@@ -622,9 +647,11 @@ mod e2e_tests {
 
         let mut arena = Box::new(AstArena::new());
         let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        assert!(run_query(q, &catalog, &mut arena, &mut out));
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
         set_tracking(false);
         assert_eq!(alloc_count(), 0, "join hot path must not allocate");
         assert_eq!(out.col_count, 2);
@@ -641,18 +668,273 @@ mod e2e_tests {
             i += 1;
         }
 
-        // Direct vector_merge_join unit check.
-        let mut left = [0i64; MAX_ROWS];
-        let mut right = [0i64; MAX_ROWS];
-        left[0] = 1;
-        left[1] = 2;
-        left[2] = 3;
-        right[0] = 3;
-        right[1] = 1;
-        right[2] = 9;
-        let mut ol = [0u16; MAX_ROWS];
-        let mut oright = [0u16; MAX_ROWS];
-        let n = vector_merge_join(&left, 3, &right, 3, &mut ol, &mut oright);
+        // Direct vector_merge_join unit check (heap scratch — no stack thrash).
+        let mut js = RuntimeScratch::new_boxed();
+        js.left_dense[0] = 1;
+        js.left_dense[1] = 2;
+        js.left_dense[2] = 3;
+        js.key_buf[0] = 3;
+        js.key_buf[1] = 1;
+        js.key_buf[2] = 9;
+        let n = vector_merge_join(
+            &js.left_dense,
+            3,
+            &js.key_buf,
+            3,
+            &mut js.join_left,
+            &mut js.join_right,
+            &mut js.left_order,
+            &mut js.right_order,
+            &mut js.tmp_u16,
+        );
         assert_eq!(n, 2);
+    }
+
+    /// Ω-STAGE2: deep chained operators — flat iterative walk, O(1) call stack.
+    #[test]
+    fn test_prevent_stack_overflow_deep_chain() {
+        // 80 filter stages × ~4 arena nodes + from/take/project stays under AST_CAP.
+        let mut q = String::from("இருந்து பயனர்கள்");
+        let mut s = 0usize;
+        while s < 80 {
+            q.push_str(" | வடி வயது > 0");
+            s += 1;
+        }
+        q.push_str(" | எடு 5 | தேடு வயது;");
+
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        assert!(
+            run_query(&q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens),
+            "deep chain must parse+execute without stack overflow"
+        );
+        assert_eq!(out.row_count, 5);
+        assert!(arena.len as usize > 80);
+        assert!(arena.len as usize <= AST_CAP);
+    }
+
+    /// Ω-STAGE2: asymmetric 1→many join — non-backtracking forward sweep.
+    #[test]
+    fn test_asymmetric_one_to_many_join_resilience() {
+        let mut sc = RuntimeScratch::new_boxed();
+        // One left key matches three right rows; another matches two.
+        sc.left_dense[0] = 7;
+        sc.left_dense[1] = 3;
+        sc.key_buf[0] = 3;
+        sc.key_buf[1] = 7;
+        sc.key_buf[2] = 7;
+        sc.key_buf[3] = 9;
+        sc.key_buf[4] = 7;
+        sc.key_buf[5] = 3;
+        let n = vector_merge_join(
+            &sc.left_dense,
+            2,
+            &sc.key_buf,
+            6,
+            &mut sc.join_left,
+            &mut sc.join_right,
+            &mut sc.left_order,
+            &mut sc.right_order,
+            &mut sc.tmp_u16,
+        );
+        assert_eq!(n, 5, "1+3 and 1+2 matches expected");
+        // Every emitted pair must share equal keys.
+        let mut i = 0usize;
+        while i < n {
+            let lk = sc.left_dense[sc.join_left[i] as usize];
+            let rk = sc.key_buf[sc.join_right[i] as usize];
+            assert_eq!(lk, rk);
+            i += 1;
+        }
+        // Count per left key without thrashing pointers.
+        let mut c7 = 0usize;
+        let mut c3 = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            match sc.left_dense[sc.join_left[i] as usize] {
+                7 => c7 += 1,
+                3 => c3 += 1,
+                _ => panic!("unexpected key"),
+            }
+            i += 1;
+        }
+        assert_eq!(c7, 3);
+        assert_eq!(c3, 2);
+
+        // End-to-end: seed a custom 1→many catalog.
+        let mut users = Table::new_boxed("பயனர்கள்".as_bytes());
+        let uid = users.add_int64_column("அடையாளம்".as_bytes()).unwrap();
+        let age = users.add_int64_column("வயது".as_bytes()).unwrap();
+        let name = users.add_utf8_column("பெயர்".as_bytes()).unwrap();
+        {
+            let c = users.int64_mut(uid).unwrap();
+            c.values[0] = 1;
+            c.validity.set(0, true);
+            c.values[1] = 2;
+            c.validity.set(1, true);
+        }
+        {
+            let c = users.int64_mut(age).unwrap();
+            c.values[0] = 30;
+            c.validity.set(0, true);
+            c.values[1] = 40;
+            c.validity.set(1, true);
+        }
+        {
+            let c = users.utf8_mut(name).unwrap();
+            c.clear();
+            assert!(c.set_row(0, "அ".as_bytes()));
+            assert!(c.set_row(1, "ஆ".as_bytes()));
+        }
+        users.set_row_count(2);
+
+        let mut orders = Table::new_boxed("ஆர்டர்கள்".as_bytes());
+        let oid = orders.add_int64_column("அடையாளம்".as_bytes()).unwrap();
+        let price = orders.add_int64_column("விலை".as_bytes()).unwrap();
+        {
+            let c = orders.int64_mut(oid).unwrap();
+            // user 1 → 3 orders; user 2 → 1 order
+            let keys = [1i64, 1, 1, 2];
+            let mut r = 0usize;
+            while r < 4 {
+                c.values[r] = keys[r];
+                c.validity.set(r, true);
+                r += 1;
+            }
+        }
+        {
+            let c = orders.int64_mut(price).unwrap();
+            let ps = [10i64, 20, 30, 40];
+            let mut r = 0usize;
+            while r < 4 {
+                c.values[r] = ps[r];
+                c.validity.set(r, true);
+                r += 1;
+            }
+        }
+        orders.set_row_count(4);
+
+        let mut cat = Catalog::new();
+        let _ = cat.register_box(users);
+        let _ = cat.register_box(orders);
+        let q = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | தேடு பெயர், விலை;";
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert_eq!(out.row_count, 4);
+    }
+
+    /// Ω-STAGE2: 2050-element chunk — two SIMD batches + 2-row scalar residue.
+    #[test]
+    fn test_unaligned_residue_tail_fidelity() {
+        const LIVE: usize = 2050;
+        assert_eq!(LIVE % BATCH_ROWS, 2);
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut i = 0usize;
+        while i < LIVE {
+            scratch.key_buf[i] = i as i64;
+            i += 1;
+        }
+        // Poison past-live sentinel — residue must not clobber it.
+        scratch.key_buf[LIVE] = -1;
+        let mut sel = SelectionVector::all(LIVE);
+        if LIVE < MAX_ROWS {
+            sel.mask[LIVE] = 0x5A;
+        }
+        Engine::filter_i64_gt(&scratch.key_buf, &mut sel, LIVE, 2047);
+        assert_eq!(sel.mask[2047], 0);
+        assert_eq!(sel.mask[2048], 1);
+        assert_eq!(sel.mask[2049], 1);
+        if LIVE < MAX_ROWS {
+            assert_eq!(sel.mask[LIVE], 0x5A, "scalar tail must not overrun");
+        }
+
+        let mut order_len = 0usize;
+        Engine::sort_i64_selected(
+            &scratch.key_buf,
+            &sel,
+            LIVE,
+            &mut scratch.order,
+            &mut order_len,
+            &mut scratch.tmp_u16,
+        );
+        assert_eq!(order_len, 2);
+        assert_eq!(scratch.order[0], 2048);
+        assert_eq!(scratch.order[1], 2049);
+
+        // Full pipeline on 2050-row table.
+        let mut table = Table::new_boxed("பயனர்கள்".as_bytes());
+        let age_i = table.add_int64_column("வயது".as_bytes()).unwrap();
+        {
+            let col = table.int64_mut(age_i).unwrap();
+            let mut r = 0usize;
+            while r < LIVE {
+                col.values[r] = r as i64;
+                col.validity.set(r, true);
+                r += 1;
+            }
+        }
+        table.set_row_count(LIVE);
+        let mut cat = Catalog::new();
+        let _ = cat.register_box(table);
+        let q = "இருந்து பயனர்கள் | வடி வயது > 2047 | அடுக்கு வயது | எடு 10 | தேடு வயது;";
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut sc2 = RuntimeScratch::new_boxed();
+        let mut tokens2 = alloc_token_window();
+        assert!(run_query(q, &cat, &mut arena, &mut out, &mut sc2, &mut tokens2));
+        assert_eq!(out.row_count, 2);
+        assert_eq!(out.int_out[0].values[0], 2048);
+        assert_eq!(out.int_out[0].values[1], 2049);
+    }
+
+    /// Ω-STAGE2: torn Tamil grapheme → discrete lex error, no panic cascade.
+    #[test]
+    fn test_malformed_tamil_boundary_fragmentation() {
+        // "தேடு" = four 3-byte Tamil codepoints (12 bytes). Mid-codepoint cuts
+        // must map to MalformedUtf8; complete-codepoint prefixes may lex as Ident.
+        let full = "தேடு".as_bytes();
+        assert_eq!(full.len(), 12);
+        // Cuts that land inside a 3-byte UTF-8 sequence (not on a lead boundary).
+        let cuts = [1usize, 2, 4, 5, 7, 8, 10, 11];
+        let mut ci = 0usize;
+        while ci < cuts.len() {
+            let cut = cuts[ci];
+            let frag = &full[..cut];
+            let mut lex = Lexer::new(frag);
+            let err = lex
+                .next_token()
+                .expect_err("torn Tamil must be MalformedUtf8");
+            match err {
+                LexerError::MalformedUtf8(cursor) => {
+                    assert!(
+                        (cursor as usize) <= cut,
+                        "cursor {cursor} must not run past cut {cut}"
+                    );
+                }
+                other => panic!("expected MalformedUtf8, got {other:?}"),
+            }
+            // Parser must map lex fault → LexMalformedUtf8 (no panic / no loop).
+            let mut arena = Box::new(AstArena::new());
+            let mut tokens_frag = alloc_token_window();
+            let perr = parse_query(frag, &mut arena, &mut tokens_frag).expect_err("parse must fail");
+            assert_eq!(perr, ParserError::LexMalformedUtf8);
+            ci += 1;
+        }
+
+        // Explicit mid-syllable "தே" cut (matches Stage-1 lexer contract).
+        let the = "தே".as_bytes();
+        assert_eq!(the.len(), 6);
+        let torn = &the[..4];
+        let mut lex = Lexer::new(torn);
+        assert_eq!(
+            lex.next_token().unwrap_err(),
+            LexerError::MalformedUtf8(0)
+        );
     }
 }

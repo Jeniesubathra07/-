@@ -101,6 +101,69 @@ impl Default for QueryResult {
     }
 }
 
+/// Cold-path working set for join / sort / execute.
+///
+/// Large `[MAX_ROWS]` buffers live here (heap via [`RuntimeScratch::new_boxed`])
+/// so the query hot path keeps an **O(1) call-stack frame** — no nested
+/// multi-megabyte stack arrays, no recursive AST or join walks.
+#[repr(C, align(64))]
+pub struct RuntimeScratch {
+    /// Compacted / sorted row order for the active pipeline.
+    pub order: [u16; MAX_ROWS],
+    /// Join output: left-row indices per match slot.
+    pub join_left: [u16; MAX_ROWS],
+    /// Join output: right-row indices per match slot.
+    pub join_right: [u16; MAX_ROWS],
+    /// LSD / merge scratch: left sorted index permutation.
+    pub left_order: [u16; MAX_ROWS],
+    /// LSD / merge scratch: right sorted index permutation.
+    pub right_order: [u16; MAX_ROWS],
+    /// LSD radix temporary scatter buffer (reused across passes).
+    pub tmp_u16: [u16; MAX_ROWS],
+    /// Dense left join keys after selection compaction.
+    pub left_dense: [i64; MAX_ROWS],
+    /// Remap dense left indices → original left row ids.
+    pub left_remap: [u16; MAX_ROWS],
+    /// Join-aware sort key buffer (left-mapped values).
+    pub key_buf: [i64; MAX_ROWS],
+}
+
+impl RuntimeScratch {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            order: [0; MAX_ROWS],
+            join_left: [0; MAX_ROWS],
+            join_right: [0; MAX_ROWS],
+            left_order: [0; MAX_ROWS],
+            right_order: [0; MAX_ROWS],
+            tmp_u16: [0; MAX_ROWS],
+            left_dense: [0; MAX_ROWS],
+            left_remap: [0; MAX_ROWS],
+            key_buf: [0; MAX_ROWS],
+        }
+    }
+
+    /// Cold-path heap construction — never place this struct on the call stack.
+    pub fn new_boxed() -> Box<Self> {
+        use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+        unsafe {
+            let layout = Layout::new::<Self>();
+            let ptr = alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            Box::from_raw(ptr)
+        }
+    }
+}
+
+impl Default for RuntimeScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Compare predicate used by the vectorized filter kernels.
 #[repr(u8)]
 #[derive(Copy, Clone)]
@@ -224,9 +287,14 @@ pub struct Engine<'a> {
 
 /// O(N+M) cache-aligned sort-merge join.
 ///
-/// Both key columns are sorted via [`lsd_radix_sort_ages`], then merged with
-/// branchless 4-lane stride advances. Matching row index pairs are written into
-/// caller-provided stack arrays `out_left` / `out_right`. Returns match count.
+/// Both key columns are sorted via [`lsd_radix_sort_ages`], then merged with a
+/// **non-backtracking constant-forward streaming tracker**: `li` / `ri` only
+/// advance (never rewind). Asymmetric 1-to-many equal-key runs are swept by a
+/// lookahead pointer over the right window while the primary left pointer stays
+/// put for the emit pass, then steps forward exactly once.
+///
+/// Permutation / tmp buffers are caller-provided (prefer [`RuntimeScratch`] fields)
+/// so no large arrays land on the call stack.
 #[inline(always)]
 pub fn vector_merge_join(
     left_keys: &[i64; MAX_ROWS],
@@ -235,13 +303,14 @@ pub fn vector_merge_join(
     right_n: usize,
     out_left: &mut [u16; MAX_ROWS],
     out_right: &mut [u16; MAX_ROWS],
+    left_order: &mut [u16; MAX_ROWS],
+    right_order: &mut [u16; MAX_ROWS],
+    tmp: &mut [u16; MAX_ROWS],
 ) -> usize {
     let ln = left_n.min(MAX_ROWS);
     let rn = right_n.min(MAX_ROWS);
 
     // Compact identity orders then LSD-sort by key (O(N) + O(M)).
-    let mut left_order = [0u16; MAX_ROWS];
-    let mut right_order = [0u16; MAX_ROWS];
     let mut i = 0usize;
     while i < ln {
         left_order[i] = i as u16;
@@ -252,14 +321,14 @@ pub fn vector_merge_join(
         right_order[j] = j as u16;
         j += 1;
     }
-    lsd_radix_sort_ages(left_keys, &mut left_order, ln);
-    lsd_radix_sort_ages(right_keys, &mut right_order, rn);
+    lsd_radix_sort_ages(left_keys, left_order, ln, tmp);
+    lsd_radix_sort_ages(right_keys, right_order, rn, tmp);
 
     let mut li = 0usize;
     let mut ri = 0usize;
     let mut out_n = 0usize;
 
-    // Linear merge — never nested O(N*M).
+    // Linear merge — never nested O(N*M), never recursive equal-run expansion.
     while li < ln && ri < rn && out_n < MAX_ROWS {
         // 4-lane software prefetch of upcoming sorted keys.
         let _pf_l0 = left_keys[left_order[li] as usize];
@@ -271,14 +340,16 @@ pub fn vector_merge_join(
         let lk = left_keys[left_order[li] as usize];
         let rk = right_keys[right_order[ri] as usize];
 
-        // Branchless advance hints; equality path emits the pair.
+        // Branchless advance hints; equality path emits the pair window.
         let lt = (lk < rk) as usize;
         let gt = (lk > rk) as usize;
         let eq = 1usize.wrapping_sub(lt | gt);
 
         if eq != 0 {
-            // Emit all right matches for this left key (stable within equal runs).
-            let mut r2 = ri;
+            // Lookahead sweep: all right rows sharing `lk` (1-to-many).
+            // `ri` is the start of the equal run; `r2` walks forward only.
+            let run_start = ri;
+            let mut r2 = run_start;
             while r2 < rn && out_n < MAX_ROWS {
                 let rk2 = right_keys[right_order[r2] as usize];
                 if rk2 != lk {
@@ -289,37 +360,45 @@ pub fn vector_merge_join(
                 out_n += 1;
                 r2 += 1;
             }
+            // Primary left pointer advances exactly once (no rewind).
             li += 1;
-            // If the next left key leaves this equal-run, advance ri past it.
+            // If the next left key stays in this equal-run, keep `ri` at run_start
+            // so the next left row re-sweeps the same right window. Otherwise
+            // advance `ri` past the exhausted equal-run (constant-forward).
             let next_same = if li < ln {
                 (left_keys[left_order[li] as usize] == lk) as usize
             } else {
                 0
             };
-            ri = if next_same != 0 { ri } else { r2 };
+            ri = if next_same != 0 { run_start } else { r2 };
         } else {
             li += lt;
             ri += gt;
         }
     }
+
+    // Scalar residue tail cleanup: when one side exhausts first, remaining
+    // opposite-side rows cannot match — leave them unemitted (O(1) exit).
+    let _ = (li, ri);
     out_n
 }
 
 /// O(N) cache-friendly LSD radix sort over selected Int64 age/key columns.
 ///
 /// Operates on a compacted index list in `order[0..order_len]`. Uses eight
-/// 256-bucket counting passes over the unsigned key `i64 ^ sign_bit`, writing
-/// through a stack `tmp` buffer — zero heap, stable, branch-light.
+/// flat iterative byte-shift passes (`shift = 0, 8, …, 56`) over the unsigned
+/// key `i64 ^ sign_bit`, writing through caller-provided `tmp` — zero heap in
+/// the hot path, stable, branch-light. **No recursion.**
 #[inline(always)]
 pub fn lsd_radix_sort_ages(
     values: &[i64; MAX_ROWS],
     order: &mut [u16; MAX_ROWS],
     order_len: usize,
+    tmp: &mut [u16; MAX_ROWS],
 ) {
     if order_len <= 1 {
         return;
     }
-    let mut tmp = [0u16; MAX_ROWS];
     let mut pass = 0u32;
     while pass < 8 {
         let shift = pass.wrapping_mul(8);
@@ -420,6 +499,7 @@ impl<'a> Engine<'a> {
         rows: usize,
         order: &mut [u16; MAX_ROWS],
         order_len: &mut usize,
+        tmp: &mut [u16; MAX_ROWS],
     ) {
         *order_len = 0;
         let n = rows.min(sel.len as usize).min(MAX_ROWS);
@@ -431,7 +511,7 @@ impl<'a> Engine<'a> {
             *order_len += take;
             i += 1;
         }
-        lsd_radix_sort_ages(values, order, *order_len);
+        lsd_radix_sort_ages(values, order, *order_len, tmp);
     }
 
     /// Apply TAKE: truncate selection / order to at most `limit` rows.
@@ -586,8 +666,16 @@ impl<'a> Engine<'a> {
         true
     }
 
-    /// Execute a parsed pipeline. Hot path uses only stack / caller-provided buffers.
-    pub fn execute(&self, arena: &AstArena, out: &mut QueryResult) -> bool {
+    /// Execute a parsed pipeline.
+    ///
+    /// Large working buffers live in `scratch` (caller-boxed). The call frame
+    /// itself stays O(1) — flat stage walk over `u32` arena indices, no recursion.
+    pub fn execute(
+        &self,
+        arena: &AstArena,
+        out: &mut QueryResult,
+        scratch: &mut RuntimeScratch,
+    ) -> bool {
         let root = match arena.get(arena.root) {
             Some(n) if n.kind == NodeKind::Pipeline => n,
             _ => return false,
@@ -595,15 +683,12 @@ impl<'a> Engine<'a> {
 
         let mut stage_id = root.left;
         let mut sel = SelectionVector::all(0);
-        let mut order = [0u16; MAX_ROWS];
         let mut order_len = 0usize;
         let mut sorted = false;
         let mut active_rows = 0usize;
         let mut table_ref: Option<&Table> = None;
         let mut right_ref: Option<&Table> = None;
         let mut joined = false;
-        let mut join_left = [0u16; MAX_ROWS];
-        let mut join_right = [0u16; MAX_ROWS];
         let mut join_len = 0usize;
 
         while stage_id != NIL {
@@ -627,7 +712,7 @@ impl<'a> Engine<'a> {
                     order_len = active_rows;
                     let mut i = 0usize;
                     while i < active_rows {
-                        order[i] = i as u16;
+                        scratch.order[i] = i as u16;
                         i += 1;
                     }
                     sorted = false;
@@ -666,37 +751,42 @@ impl<'a> Engine<'a> {
                         Some(c) => &c.values,
                         None => return false,
                     };
-                    // Restrict left side to currently selected rows.
-                    let mut left_dense = [0i64; MAX_ROWS];
-                    let mut left_remap = [0u16; MAX_ROWS];
+                    // Restrict left side to currently selected rows (dense).
                     let mut ln = 0usize;
                     let mut i = 0usize;
                     while i < active_rows {
                         if sel.mask[i] != 0 {
-                            left_dense[ln] = left_keys[i];
-                            left_remap[ln] = i as u16;
+                            scratch.left_dense[ln] = left_keys[i];
+                            scratch.left_remap[ln] = i as u16;
                             ln += 1;
                         }
                         i += 1;
                     }
                     let rn = right.row_count as usize;
-                    let mut tmp_left = [0u16; MAX_ROWS];
-                    let mut tmp_right = [0u16; MAX_ROWS];
+                    // Disjoint scratch fields: dense keys + merge outs + sort perms.
                     let matches = vector_merge_join(
-                        &left_dense,
+                        &scratch.left_dense,
                         ln,
                         right_keys,
                         rn,
-                        &mut tmp_left,
-                        &mut tmp_right,
+                        &mut scratch.join_left,
+                        &mut scratch.join_right,
+                        &mut scratch.left_order,
+                        &mut scratch.right_order,
+                        &mut scratch.tmp_u16,
                     );
                     // Remap dense left indices back to original left row ids.
                     join_len = 0;
                     let mut m = 0usize;
                     while m < matches {
-                        join_left[join_len] = left_remap[tmp_left[m] as usize];
-                        join_right[join_len] = tmp_right[m];
+                        let dense = scratch.join_left[m] as usize;
+                        scratch.tmp_u16[join_len] = scratch.left_remap[dense];
                         join_len += 1;
+                        m += 1;
+                    }
+                    let mut m = 0usize;
+                    while m < join_len {
+                        scratch.join_left[m] = scratch.tmp_u16[m];
                         m += 1;
                     }
                     joined = true;
@@ -706,7 +796,7 @@ impl<'a> Engine<'a> {
                     order_len = join_len;
                     let mut k = 0usize;
                     while k < join_len {
-                        order[k] = k as u16;
+                        scratch.order[k] = k as u16;
                         k += 1;
                     }
                     sorted = false;
@@ -740,9 +830,10 @@ impl<'a> Engine<'a> {
                             Some(c) => &c.values,
                             None => return false,
                         };
+                        // Scalar residue-style per-slot walk (join slots ≠ row batches).
                         let mut i = 0usize;
                         while i < join_len {
-                            let src = join_left[i] as usize;
+                            let src = scratch.join_left[i] as usize;
                             let v = values[src];
                             let pass = match bin.op {
                                 TokenKind::Gt => (v > lit) as u8,
@@ -756,7 +847,7 @@ impl<'a> Engine<'a> {
                         order_len = 0;
                         let mut i = 0usize;
                         while i < join_len {
-                            order[order_len] = i as u16;
+                            scratch.order[order_len] = i as u16;
                             order_len += sel.mask[i] as usize;
                             i += 1;
                         }
@@ -768,7 +859,7 @@ impl<'a> Engine<'a> {
                             order_len = 0;
                             let mut i = 0usize;
                             while i < active_rows {
-                                order[order_len] = i as u16;
+                                scratch.order[order_len] = i as u16;
                                 order_len += sel.mask[i] as usize;
                                 i += 1;
                             }
@@ -776,9 +867,9 @@ impl<'a> Engine<'a> {
                             let mut w = 0usize;
                             let mut r = 0usize;
                             while r < order_len {
-                                let idx = order[r] as usize;
+                                let idx = scratch.order[r] as usize;
                                 let keep = if idx < active_rows { sel.mask[idx] } else { 0 };
-                                order[w] = order[r];
+                                scratch.order[w] = scratch.order[r];
                                 w += keep as usize;
                                 r += 1;
                             }
@@ -804,26 +895,26 @@ impl<'a> Engine<'a> {
                         Some(col_data) => {
                             if joined {
                                 // Sort join slots by left-mapped key values.
-                                let mut key_buf = [0i64; MAX_ROWS];
                                 let mut i = 0usize;
                                 while i < join_len {
-                                    key_buf[i] = col_data.values[join_left[i] as usize];
+                                    scratch.key_buf[i] =
+                                        col_data.values[scratch.join_left[i] as usize];
                                     i += 1;
                                 }
-                                let mut tmp_order = [0u16; MAX_ROWS];
+                                // Stage sorted indices into left_order, then copy to order.
                                 let mut tmp_len = 0usize;
-                                // Build selection over join slots.
                                 Engine::sort_i64_selected(
-                                    &key_buf,
+                                    &scratch.key_buf,
                                     &sel,
                                     join_len,
-                                    &mut tmp_order,
+                                    &mut scratch.left_order,
                                     &mut tmp_len,
+                                    &mut scratch.tmp_u16,
                                 );
                                 order_len = tmp_len;
                                 let mut k = 0usize;
                                 while k < tmp_len {
-                                    order[k] = tmp_order[k];
+                                    scratch.order[k] = scratch.left_order[k];
                                     k += 1;
                                 }
                                 sorted = true;
@@ -832,8 +923,9 @@ impl<'a> Engine<'a> {
                                     &col_data.values,
                                     &sel,
                                     active_rows,
-                                    &mut order,
+                                    &mut scratch.order,
                                     &mut order_len,
+                                    &mut scratch.tmp_u16,
                                 );
                                 sorted = true;
                             }
@@ -852,12 +944,12 @@ impl<'a> Engine<'a> {
                     if !self.materialize_projection(
                         table,
                         right_ref,
-                        &join_left,
-                        &join_right,
+                        &scratch.join_left,
+                        &scratch.join_right,
                         joined,
                         stage,
                         arena,
-                        &order,
+                        &scratch.order,
                         order_len,
                         out,
                     ) {
@@ -885,16 +977,27 @@ pub fn demo_catalog() -> Catalog {
 }
 
 /// End-to-end: parse + execute a Tamil pipeline query string.
-pub fn run_query(src: &str, catalog: &Catalog, arena: &mut AstArena, out: &mut QueryResult) -> bool {
+///
+/// `scratch` and `tokens` must be caller-provided (prefer
+/// [`RuntimeScratch::new_boxed`] / [`crate::parser::alloc_token_window`]) so the
+/// hot path never allocates and never places large arrays on the stack.
+pub fn run_query(
+    src: &str,
+    catalog: &Catalog,
+    arena: &mut AstArena,
+    out: &mut QueryResult,
+    scratch: &mut RuntimeScratch,
+    tokens: &mut [crate::lexer::Token; crate::lexer::MAX_TOKENS],
+) -> bool {
     arena.len = 0;
     arena.root = NIL;
-    let root = match crate::parser::parse_query(src.as_bytes(), arena) {
+    let root = match crate::parser::parse_query(src.as_bytes(), arena, tokens) {
         Ok(r) => r,
         Err(_) => return false,
     };
     debug_assert_eq!(arena.root, root);
     let engine = Engine::new(catalog, src.as_bytes());
-    engine.execute(arena, out)
+    engine.execute(arena, out, scratch)
 }
 
 #[cfg(test)]
@@ -906,9 +1009,11 @@ mod tests {
     fn executes_filter_sort_take_project() {
         let cat = demo_catalog();
         let q = "இருந்து பயனர்கள் | வடி வயது > 21 | அடுக்கு வயது | எடு 10 | தேடு பெயர், வயது;";
-        let mut arena = AstArena::new();
+        let mut arena = Box::new(AstArena::new());
         let mut out = QueryResult::new_boxed();
-        assert!(run_query(q, &cat, &mut arena, &mut out));
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = crate::parser::alloc_token_window();
+        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens));
         assert_eq!(out.col_count, 2);
         assert_eq!(out.row_count, 10);
         let mut prev = i64::MIN;
@@ -925,23 +1030,29 @@ mod tests {
 
     #[test]
     fn radix_sort_selected_is_stable_ascending() {
-        let mut values = [0i64; MAX_ROWS];
+        let mut scratch = RuntimeScratch::new_boxed();
         // Unsorted ages with duplicates to exercise stable LSD passes.
         let raw: [i64; 12] = [30, 10, 20, 10, 40, 5, 20, 15, 5, 40, 25, 1];
         let mut i = 0usize;
         while i < 12 {
-            values[i] = raw[i];
+            scratch.key_buf[i] = raw[i];
             i += 1;
         }
         let sel = SelectionVector::all(12);
-        let mut order = [0u16; MAX_ROWS];
         let mut order_len = 0usize;
-        Engine::sort_i64_selected(&values, &sel, 12, &mut order, &mut order_len);
+        Engine::sort_i64_selected(
+            &scratch.key_buf,
+            &sel,
+            12,
+            &mut scratch.order,
+            &mut order_len,
+            &mut scratch.tmp_u16,
+        );
         assert_eq!(order_len, 12);
         let mut prev = i64::MIN;
         let mut j = 0usize;
         while j < order_len {
-            let v = values[order[j] as usize];
+            let v = scratch.key_buf[scratch.order[j] as usize];
             assert!(v >= prev);
             prev = v;
             j += 1;
@@ -950,12 +1061,12 @@ mod tests {
         let mut seen_first_10 = false;
         let mut k = 0usize;
         while k < order_len {
-            if values[order[k] as usize] == 10 {
+            if scratch.key_buf[scratch.order[k] as usize] == 10 {
                 if !seen_first_10 {
-                    assert_eq!(order[k], 1);
+                    assert_eq!(scratch.order[k], 1);
                     seen_first_10 = true;
                 } else {
-                    assert_eq!(order[k], 3);
+                    assert_eq!(scratch.order[k], 3);
                     break;
                 }
             }

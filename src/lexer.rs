@@ -439,7 +439,15 @@ mod tests {
     fn lexes_pipeline_keywords() {
         let q = "இருந்து பயனர்கள் | வடி வயது > 21 | அடுக்கு வயது | எடு 10 | தேடு பெயர், வயது;";
         let mut lex = Lexer::new(q.as_bytes());
-        let mut buf = [Token::eof(); MAX_TOKENS];
+        let mut buf = {
+            use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+            unsafe {
+                let layout = Layout::new::<[Token; MAX_TOKENS]>();
+                let ptr = alloc_zeroed(layout) as *mut [Token; MAX_TOKENS];
+                if ptr.is_null() { handle_alloc_error(layout); }
+                Box::from_raw(ptr)
+            }
+        };
         let n = lex.tokenize_into(&mut buf).expect("tokenize");
         assert!(n > 10);
         assert_eq!(buf[0].kind, TokenKind::Irundu);

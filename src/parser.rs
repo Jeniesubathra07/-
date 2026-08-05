@@ -193,19 +193,41 @@ impl AstArena {
 }
 
 /// Linear recursive-descent-free parser over a fixed token window.
+///
+/// The token buffer is **caller-provided** (prefer a heap `Box` via
+/// [`alloc_token_window`]) so deep pipelines never place
+/// `[Token; MAX_TOKENS]` (~196 KiB) on the call stack.
 #[repr(C)]
 pub struct Parser<'a> {
     src: &'a [u8],
-    tokens: [Token; MAX_TOKENS],
+    tokens: &'a [Token; MAX_TOKENS],
     tok_len: usize,
     cursor: usize,
 }
 
+/// Cold-path token window — zeroed then ready for [`Lexer::tokenize_into`].
+#[inline(always)]
+pub fn alloc_token_window() -> Box<[Token; MAX_TOKENS]> {
+    use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+    unsafe {
+        let layout = Layout::new::<[Token; MAX_TOKENS]>();
+        let ptr = alloc_zeroed(layout) as *mut [Token; MAX_TOKENS];
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        Box::from_raw(ptr)
+    }
+}
+
 impl<'a> Parser<'a> {
-    pub fn try_from_source(src: &'a [u8]) -> Result<Self, ParserError> {
+    pub fn try_from_source(
+        src: &'a [u8],
+        tokens: &'a mut [Token; MAX_TOKENS],
+    ) -> Result<Self, ParserError> {
         let mut lexer = Lexer::new(src);
-        let mut tokens = [Token::eof(); MAX_TOKENS];
-        let tok_len = lexer.tokenize_into(&mut tokens).map_err(ParserError::from_lexer)?;
+        let tok_len = lexer
+            .tokenize_into(tokens)
+            .map_err(ParserError::from_lexer)?;
         Ok(Self {
             src,
             tokens,
@@ -215,15 +237,24 @@ impl<'a> Parser<'a> {
     }
 
     /// Backward-compatible constructor; empty token stream on lex failure.
-    pub fn from_source(src: &'a [u8]) -> Self {
-        match Self::try_from_source(src) {
-            Ok(p) => p,
-            Err(_) => Self {
+    pub fn from_source(src: &'a [u8], tokens: &'a mut [Token; MAX_TOKENS]) -> Self {
+        let mut lexer = Lexer::new(src);
+        match lexer.tokenize_into(tokens) {
+            Ok(tok_len) => Self {
                 src,
-                tokens: [Token::eof(); MAX_TOKENS],
-                tok_len: 1,
+                tokens,
+                tok_len,
                 cursor: 0,
             },
+            Err(_) => {
+                tokens[0] = Token::eof();
+                Self {
+                    src,
+                    tokens,
+                    tok_len: 1,
+                    cursor: 0,
+                }
+            }
         }
     }
 
@@ -575,8 +606,15 @@ impl<'a> Parser<'a> {
 }
 
 /// Lex + parse a query into `arena`, surfacing arena / UTF-8 faults explicitly.
-pub fn parse_query(src: &[u8], arena: &mut AstArena) -> Result<u32, ParserError> {
-    let mut parser = Parser::try_from_source(src)?;
+///
+/// `tokens` must be a pre-allocated window (prefer [`alloc_token_window`]) so
+/// the parse path never places `[Token; MAX_TOKENS]` on the call stack.
+pub fn parse_query(
+    src: &[u8],
+    arena: &mut AstArena,
+    tokens: &mut [Token; MAX_TOKENS],
+) -> Result<u32, ParserError> {
+    let mut parser = Parser::try_from_source(src, tokens)?;
     parser.parse_pipeline(arena)
 }
 
@@ -588,7 +626,8 @@ mod tests {
     fn parses_demo_pipeline() {
         let q = "இருந்து பயனர்கள் | வடி வயது > 21 | அடுக்கு வயது | எடு 10 | தேடு பெயர், வயது;";
         let mut arena = AstArena::new();
-        let root = parse_query(q.as_bytes(), &mut arena).expect("parse");
+        let mut tokens = alloc_token_window();
+        let root = parse_query(q.as_bytes(), &mut arena, &mut tokens).expect("parse");
         let pipe = arena.get(root).unwrap();
         assert_eq!(pipe.kind, NodeKind::Pipeline);
         let mut stage = pipe.left;
@@ -613,7 +652,8 @@ mod tests {
         let mut arena = AstArena::new();
         // Saturate the flat structural boundary before parsing.
         arena.len = AST_CAP as u32;
-        let err = parse_query(q.as_bytes(), &mut arena).expect_err("must overflow");
+        let mut tokens = alloc_token_window();
+        let err = parse_query(q.as_bytes(), &mut arena, &mut tokens).expect_err("must overflow");
         assert_eq!(err, ParserError::ArenaOverflow);
         // No panic / no OOB — len stays at capacity.
         assert!(arena.is_full());
@@ -623,7 +663,8 @@ mod tests {
     fn missing_source_context_without_irundu() {
         let q = "வடி வயது > 21 | எடு 10;";
         let mut arena = AstArena::new();
-        let err = parse_query(q.as_bytes(), &mut arena).expect_err("need source");
+        let mut tokens = alloc_token_window();
+        let err = parse_query(q.as_bytes(), &mut arena, &mut tokens).expect_err("need source");
         assert_eq!(err, ParserError::MissingSourceContext);
     }
 }
