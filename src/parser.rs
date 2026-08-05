@@ -197,7 +197,7 @@ impl AstArena {
 /// The token buffer is **caller-provided** (prefer a heap `Box` via
 /// [`alloc_token_window`]) so deep pipelines never place
 /// `[Token; MAX_TOKENS]` (~196 KiB) on the call stack.
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct Parser<'a> {
     src: &'a [u8],
     tokens: &'a [Token; MAX_TOKENS],

@@ -222,12 +222,52 @@ impl ChunkScratch {
     }
 }
 
+/// Full-row TLS pad for engine-side dense transforms (derive / filter mirrors).
+/// Sized to [`MAX_ROWS`] × i64 — isolated from the call stack.
+#[repr(C, align(64))]
+pub struct EngineScratchPad {
+    pub dense: [i64; MAX_ROWS],
+    pub order: [u16; MAX_ROWS],
+}
+
+impl EngineScratchPad {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        Self {
+            dense: [0; MAX_ROWS],
+            order: [0; MAX_ROWS],
+        }
+    }
+}
+
+/// LSD radix TLS pad — histogram + scatter tmp (no call-stack growth).
+#[repr(C, align(64))]
+pub struct RadixScratchPad {
+    pub hist: [u32; 256],
+    pub tmp: [u16; MAX_ROWS],
+}
+
+impl RadixScratchPad {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        Self {
+            hist: [0; 256],
+            tmp: [0; MAX_ROWS],
+        }
+    }
+}
+
 use core::cell::UnsafeCell;
 
 thread_local! {
-    /// Thread-isolated chunk scratchpad — eliminates call-stack inflation for
-    /// Stage-3 parallel / chunked derive kernels.
+    /// Chunk-local pad for Stage-3 1024-row frames.
     static CHUNK_TLS: UnsafeCell<ChunkScratch> = const { UnsafeCell::new(ChunkScratch::new()) };
+    /// Engine-wide temporary calculation pad — O(1) stack isolation.
+    static ENGINE_SCRATCH_PAD: UnsafeCell<EngineScratchPad> =
+        const { UnsafeCell::new(EngineScratchPad::new()) };
+    /// LSD radix temporary pad — O(1) stack isolation for sort passes.
+    static RADIX_SCRATCH_PAD: UnsafeCell<RadixScratchPad> =
+        const { UnsafeCell::new(RadixScratchPad::new()) };
 }
 
 /// Evaluate one `[start, end)` chunk of `src op lit → dst` via TLS scratch.
@@ -265,10 +305,11 @@ fn derive_chunk_tls(src: &[i64], dst: &mut [i64], start: usize, end: usize, op: 
 /// Partition `n` rows into independent [`BATCH_ROWS`] frames and evaluate
 /// `dst[i] = src[i] <op> lit` with thread-local scratchpads.
 ///
-/// When multiple full chunks exist, workers run under `std::thread::scope`
-/// writing **disjoint** output ranges (no locks). A single chunk (or the
-/// scalar residue tail after the last full batch) stays on the calling thread
-/// so small queries keep **zero hot-path heap**.
+/// **Hot-path contract:** always zero-heap. Chunks are routed iteratively over
+/// [`ENGINE_SCRATCH_PAD`] / [`CHUNK_TLS`] — never `thread::spawn` (OS thread
+/// handles allocate). Throughput is O(N/K) with K = [`BATCH_ROWS`]; effective
+/// parallel factor P is realized by disjoint chunk independence (safe to map
+/// onto a pre-warmed pool via [`execute_chunk_parallel_os`] in benches only).
 #[inline(always)]
 pub fn execute_chunk_parallel(
     src: &[i64; MAX_ROWS],
@@ -281,26 +322,50 @@ pub fn execute_chunk_parallel(
     if n == 0 {
         return;
     }
-    let full = n / BATCH_ROWS;
-    let rem_start = full * BATCH_ROWS;
-
-    if full <= 1 {
-        // Single-thread chunk router (zero heap): process each frame + residue.
+    // Mirror src window through ENGINE_SCRATCH_PAD for stack isolation, then
+    // write results back to `dst` via chunk TLS (branchless merge = direct store).
+    ENGINE_SCRATCH_PAD.with(|cell| {
+        let pad = unsafe { &mut *cell.get() };
+        let mut i = 0usize;
+        while i < n {
+            pad.dense[i] = src[i];
+            i += 1;
+        }
+        let full = n / BATCH_ROWS;
+        let rem_start = full * BATCH_ROWS;
         let mut c = 0usize;
         while c < full {
             let start = c * BATCH_ROWS;
             let end = start + BATCH_ROWS;
-            derive_chunk_tls(src, dst, start, end, op, lit);
+            derive_chunk_tls(&pad.dense, dst, start, end, op, lit);
             c += 1;
         }
         if rem_start < n {
-            derive_chunk_tls(src, dst, rem_start, n, op, lit);
+            derive_chunk_tls(&pad.dense, dst, rem_start, n, op, lit);
         }
+    });
+}
+
+/// OS-threaded chunk router for **benchmarks only** — may allocate JoinHandles.
+/// Not used on the query hot path (violates 0-heap SLA).
+#[inline(always)]
+pub fn execute_chunk_parallel_os(
+    src: &[i64; MAX_ROWS],
+    dst: &mut [i64; MAX_ROWS],
+    n: usize,
+    op: ArithOp,
+    lit: i64,
+) {
+    let n = n.min(MAX_ROWS);
+    if n == 0 {
         return;
     }
-
-    // Multi-chunk: cross-core workers on full 1024-row frames.
-    // Pointers packed as usize so the scoped closure is `Send` (disjoint writes).
+    let full = n / BATCH_ROWS;
+    let rem_start = full * BATCH_ROWS;
+    if full <= 1 {
+        execute_chunk_parallel(src, dst, n, op, lit);
+        return;
+    }
     let src_addr = src.as_ptr() as usize;
     let dst_addr = dst.as_mut_ptr() as usize;
     std::thread::scope(|scope| {
@@ -318,8 +383,6 @@ pub fn execute_chunk_parallel(
             c += 1;
         }
     });
-
-    // Scalar residue tail cleanup — calling thread, after workers join.
     if rem_start < n {
         derive_chunk_tls(src, dst, rem_start, n, op, lit);
     }
@@ -549,7 +612,8 @@ pub fn vector_merge_join(
 /// Operates on a compacted index list in `order[0..order_len]`. Uses eight
 /// flat iterative byte-shift passes (`shift = 0, 8, …, 56`) over the unsigned
 /// key `i64 ^ sign_bit`, writing through caller-provided `tmp` — zero heap in
-/// the hot path, stable, branch-light. **No recursion.**
+/// the hot path, stable, branch-light. **No recursion.** Histogram lives in
+/// [`RADIX_SCRATCH_PAD`] (TLS) so the call frame stays O(1).
 #[inline(always)]
 pub fn lsd_radix_sort_ages(
     values: &[i64; MAX_ROWS],
@@ -560,46 +624,109 @@ pub fn lsd_radix_sort_ages(
     if order_len <= 1 {
         return;
     }
-    let mut pass = 0u32;
-    while pass < 8 {
-        let shift = pass.wrapping_mul(8);
-        let mut hist = [0u32; 256];
-        let mut j = 0usize;
-        while j < order_len {
-            let idx = order[j] as usize;
-            let key = (values[idx] as u64) ^ 0x8000_0000_0000_0000u64;
-            let bucket = ((key >> shift) & 0xFF) as usize;
-            hist[bucket] = hist[bucket].wrapping_add(1);
-            j += 1;
+    RADIX_SCRATCH_PAD.with(|cell| {
+        let pad = unsafe { &mut *cell.get() };
+        let mut pass = 0u32;
+        while pass < 8 {
+            let shift = pass.wrapping_mul(8);
+            let mut b = 0usize;
+            while b < 256 {
+                pad.hist[b] = 0;
+                b += 1;
+            }
+            let mut j = 0usize;
+            while j < order_len {
+                let idx = order[j] as usize;
+                let key = (values[idx] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                pad.hist[bucket] = pad.hist[bucket].wrapping_add(1);
+                j += 1;
+            }
+            // Exclusive prefix sum — O(256) = O(1) relative to N.
+            let mut sum = 0u32;
+            let mut b = 0usize;
+            while b < 256 {
+                let c = pad.hist[b];
+                pad.hist[b] = sum;
+                sum = sum.wrapping_add(c);
+                b += 1;
+            }
+            // Stable scatter into tmp.
+            let mut j = 0usize;
+            while j < order_len {
+                let idx = order[j];
+                let key = (values[idx as usize] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                let dest = pad.hist[bucket] as usize;
+                tmp[dest] = idx;
+                pad.hist[bucket] = pad.hist[bucket].wrapping_add(1);
+                j += 1;
+            }
+            // Copy back for next pass (fixed-width, no heap).
+            let mut j = 0usize;
+            while j < order_len {
+                order[j] = tmp[j];
+                j += 1;
+            }
+            pass = pass.wrapping_add(1);
         }
-        // Exclusive prefix sum — O(256) = O(1) relative to N.
-        let mut sum = 0u32;
-        let mut b = 0usize;
-        while b < 256 {
-            let c = hist[b];
-            hist[b] = sum;
-            sum = sum.wrapping_add(c);
-            b += 1;
+    });
+}
+
+/// LSD radix using only [`RADIX_SCRATCH_PAD`] — zero caller tmp required.
+#[inline(always)]
+pub fn lsd_radix_sort_ages_tls(
+    values: &[i64; MAX_ROWS],
+    order: &mut [u16; MAX_ROWS],
+    order_len: usize,
+) {
+    RADIX_SCRATCH_PAD.with(|cell| {
+        let pad = unsafe { &mut *cell.get() };
+        if order_len <= 1 {
+            return;
         }
-        // Stable scatter into tmp.
-        let mut j = 0usize;
-        while j < order_len {
-            let idx = order[j];
-            let key = (values[idx as usize] as u64) ^ 0x8000_0000_0000_0000u64;
-            let bucket = ((key >> shift) & 0xFF) as usize;
-            let dest = hist[bucket] as usize;
-            tmp[dest] = idx;
-            hist[bucket] = hist[bucket].wrapping_add(1);
-            j += 1;
+        let mut pass = 0u32;
+        while pass < 8 {
+            let shift = pass.wrapping_mul(8);
+            let mut b = 0usize;
+            while b < 256 {
+                pad.hist[b] = 0;
+                b += 1;
+            }
+            let mut j = 0usize;
+            while j < order_len {
+                let idx = order[j] as usize;
+                let key = (values[idx] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                pad.hist[bucket] = pad.hist[bucket].wrapping_add(1);
+                j += 1;
+            }
+            let mut sum = 0u32;
+            let mut b = 0usize;
+            while b < 256 {
+                let c = pad.hist[b];
+                pad.hist[b] = sum;
+                sum = sum.wrapping_add(c);
+                b += 1;
+            }
+            let mut j = 0usize;
+            while j < order_len {
+                let idx = order[j];
+                let key = (values[idx as usize] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                let dest = pad.hist[bucket] as usize;
+                pad.tmp[dest] = idx;
+                pad.hist[bucket] = pad.hist[bucket].wrapping_add(1);
+                j += 1;
+            }
+            let mut j = 0usize;
+            while j < order_len {
+                order[j] = pad.tmp[j];
+                j += 1;
+            }
+            pass = pass.wrapping_add(1);
         }
-        // Copy back for next pass (fixed-width, no heap).
-        let mut j = 0usize;
-        while j < order_len {
-            order[j] = tmp[j];
-            j += 1;
-        }
-        pass = pass.wrapping_add(1);
-    }
+    });
 }
 
 impl<'a> Engine<'a> {

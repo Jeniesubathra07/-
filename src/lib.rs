@@ -20,8 +20,9 @@ pub mod utf8;
 
 pub use lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
 pub use runtime::{
-    demo_catalog, execute_chunk_parallel, lsd_radix_sort_ages, run_query, vector_merge_join,
-    ArithOp, ChunkScratch, Engine, QueryResult, RuntimeScratch,
+    demo_catalog, execute_chunk_parallel, execute_chunk_parallel_os, lsd_radix_sort_ages,
+    lsd_radix_sort_ages_tls, run_query, vector_merge_join, ArithOp, ChunkScratch, Engine,
+    EngineScratchPad, QueryResult, RadixScratchPad, RuntimeScratch,
 };
 pub use storage::{
     seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColName, ColumnData,
@@ -1033,5 +1034,80 @@ mod e2e_tests {
         assert_eq!(alloc_count(), 0);
         assert_eq!(out.row_count, 11);
         assert!(out.int_out[0].values[0] > 200);
+    }
+
+    /// Ω-QA-CORE-STRESS-STAGE3 — micro-arch checklist matrix (release-safe).
+    #[test]
+    fn omega_qa_stage3_matrix() {
+        // --- GATE 3: cache-line packing density ---
+        assert_eq!(core::mem::align_of::<AstArena>(), 64);
+        assert_eq!(core::mem::align_of::<QueryResult>(), 64);
+        assert_eq!(core::mem::align_of::<RuntimeScratch>(), 64);
+        assert_eq!(core::mem::align_of::<Int64Column>(), 64);
+        assert_eq!(core::mem::align_of::<Utf8Column>(), 64);
+        assert_eq!(core::mem::align_of::<SelectionVector>(), 64);
+        assert_eq!(core::mem::align_of::<Table>(), 64);
+        assert_eq!(core::mem::align_of::<FixedOrdersDatabase>(), 64);
+        assert_eq!(core::mem::align_of::<ChunkScratch>(), 64);
+        assert_eq!(core::mem::align_of::<EngineScratchPad>(), 64);
+        assert_eq!(core::mem::align_of::<RadixScratchPad>(), 64);
+        assert_eq!(core::mem::align_of::<Parser<'static>>(), 64);
+        assert_eq!(core::mem::size_of::<AstNode>(), 32);
+
+        // --- GATE 4: 2050-row unaligned residue (2×1024 + 2) ---
+        const LIVE: usize = 2050;
+        let mut sc = RuntimeScratch::new_boxed();
+        let mut i = 0usize;
+        while i < LIVE {
+            sc.key_buf[i] = i as i64;
+            i += 1;
+        }
+        let mut sel = SelectionVector::all(LIVE);
+        Engine::filter_i64_gt(&sc.key_buf, &mut sel, LIVE, 2047);
+        assert_eq!(sel.mask[2047], 0);
+        assert_eq!(sel.mask[2048], 1);
+        assert_eq!(sel.mask[2049], 1);
+        execute_chunk_parallel(&sc.key_buf, &mut sc.derived, LIVE, ArithOp::Mul, 3);
+        assert_eq!(sc.derived[2048], 2048 * 3);
+        assert_eq!(sc.derived[2049], 2049 * 3);
+
+        // --- GATE 2: TLS radix pad flatness ---
+        let mut j = 0usize;
+        while j < 16 {
+            sc.order[j] = (15 - j) as u16;
+            sc.key_buf[j] = (15 - j) as i64;
+            j += 1;
+        }
+        lsd_radix_sort_ages_tls(&sc.key_buf, &mut sc.order, 16);
+        let mut prev = i64::MIN;
+        let mut k = 0usize;
+        while k < 16 {
+            let v = sc.key_buf[sc.order[k] as usize];
+            assert!(v >= prev);
+            prev = v;
+            k += 1;
+        }
+
+        // --- GATE 5: mid-syllable Tamil tear ---
+        let torn = &"தேடு".as_bytes()[..5];
+        let mut lex = Lexer::new(torn);
+        match lex.next_token() {
+            Err(LexerError::MalformedUtf8(_)) => {}
+            other => panic!("expected MalformedUtf8, got {other:?}"),
+        }
+
+        // --- GATE 1: zero-heap hot path on Stage-3 query ---
+        let q = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | கணி புதிய_விலை = விலை * 2 | வடி புதிய_விலை > 200;";
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        reset_counters();
+        set_tracking(true);
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0, "GATE1 heap must stay 0");
+        assert_eq!(out.row_count, 11);
     }
 }

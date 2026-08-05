@@ -5,6 +5,7 @@ edition = "2021"
 description = "Microsecond-scale Tamil-native linear pipeline vector query engine and columnar database"
 license = "MIT"
 rust-version = "1.70"
+autobenches = false
 
 [lib]
 name = "tamil_query_engine"
@@ -13,6 +14,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "tamil_query_engine"
 path = "src/main.rs"
+
+[[bin]]
+name = "stage3_bench"
+path = "benches/stage3_pipeline.rs"
 
 [profile.release]
 opt-level = 3
