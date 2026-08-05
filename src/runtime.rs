@@ -533,18 +533,36 @@ pub fn vector_merge_join(
 ) -> usize {
     let ln = left_n.min(MAX_ROWS);
     let rn = right_n.min(MAX_ROWS);
+    if ln == 0 || rn == 0 {
+        return 0;
+    }
 
-    // Compact identity orders then LSD-sort by key (O(N) + O(M)).
+    // Compact identity + register min/max range probes (single forward pass).
+    let mut lmin = i64::MAX;
+    let mut lmax = i64::MIN;
     let mut i = 0usize;
     while i < ln {
         left_order[i] = i as u16;
+        let k = left_keys[i];
+        lmin = if k < lmin { k } else { lmin };
+        lmax = if k > lmax { k } else { lmax };
         i += 1;
     }
+    let mut rmin = i64::MAX;
+    let mut rmax = i64::MIN;
     let mut j = 0usize;
     while j < rn {
         right_order[j] = j as u16;
+        let k = right_keys[j];
+        rmin = if k < rmin { k } else { rmin };
+        rmax = if k > rmax { k } else { rmax };
         j += 1;
     }
+    // Constant-time sparsity fast-abort: disjoint key domains → zero matches.
+    if lmax < rmin || rmax < lmin {
+        return 0;
+    }
+
     lsd_radix_sort_ages(left_keys, left_order, ln, tmp);
     lsd_radix_sort_ages(right_keys, right_order, rn, tmp);
 

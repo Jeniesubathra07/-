@@ -310,7 +310,7 @@ mod e2e_tests {
 
     /// Simulates a massive 1025-stage pipeline and proves ArenaOverflow.
     #[test]
-    fn test_arena_overflow_prevention() {
+    fn test_arena_overflow_via_deep_pipeline_stages() {
         let mut q = String::from("இருந்து பயனர்கள்");
         // 1025 filter stages ⇒ far beyond AST_CAP node budget.
         let mut i = 0usize;
@@ -939,57 +939,22 @@ mod e2e_tests {
         );
     }
 
-    /// INF-STAGE3: `கணி` arithmetic derive + filter on derived column, zero heap.
+    /// INF-STAGE3 (legacy): `கணி` arithmetic derive — superseded by matrix TIER E.12.
     #[test]
-    fn test_derive_math_pipeline_evaluation() {
+    fn test_derive_math_pipeline_evaluation_legacy_smoke() {
         let q = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | கணி புதிய_விலை = விலை * 2 | வடி புதிய_விலை > 200;";
-
-        // Lexer must emit Kani + Star for the derive assignment.
-        let mut lex = Lexer::new(q.as_bytes());
-        let mut saw_kani = false;
-        let mut saw_star = false;
-        loop {
-            match lex.next_token() {
-                Ok(t) if t.kind == TokenKind::Eof => break,
-                Ok(t) if t.kind == TokenKind::Kani => {
-                    assert_eq!(t.text(q.as_bytes()), Some("கணி"));
-                    saw_kani = true;
-                }
-                Ok(t) if t.kind == TokenKind::Star => saw_star = true,
-                Ok(_) => {}
-                Err(e) => panic!("lex fault: {e:?}"),
-            }
-        }
-        assert!(saw_kani);
-        assert!(saw_star);
-
         let catalog = demo_catalog();
         let mut arena = Box::new(AstArena::new());
         let mut out = QueryResult::new_boxed();
         let mut scratch = RuntimeScratch::new_boxed();
         let mut tokens = alloc_token_window();
-        reset_counters();
-        set_tracking(true);
         assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
-        set_tracking(false);
-        assert_eq!(alloc_count(), 0, "derive hot path must not allocate");
-        assert_eq!(scratch.has_derived, 1);
-        assert_eq!(scratch.derived_name.as_bytes(), "புதிய_விலை".as_bytes());
-        // price*2 > 200 ⇒ price > 100; seeded 100 drops → 11 rows.
-        assert_eq!(out.col_count, 1);
         assert_eq!(out.row_count, 11);
-        let mut i = 0usize;
-        while i < out.row_count as usize {
-            assert!(out.int_out[0].values[i] > 200);
-            assert_eq!(out.int_out[0].values[i] % 2, 0);
-            i += 1;
-        }
     }
 
-    /// INF-STAGE3: chunk-parallel derive integrity across 2050 rows + Tamil query.
+    /// INF-STAGE3 (legacy): chunk router smoke — superseded by matrix TIER E.11.
     #[test]
-    fn test_parallel_chunk_distribution_integrity() {
-        // --- A: 2050-row chunk router (2 full batches + 2-row residue) ---
+    fn test_parallel_chunk_distribution_integrity_legacy_smoke() {
         const LIVE: usize = 2050;
         let mut src = RuntimeScratch::new_boxed();
         let mut dst = RuntimeScratch::new_boxed();
@@ -999,41 +964,8 @@ mod e2e_tests {
             i += 1;
         }
         execute_chunk_parallel(&src.key_buf, &mut dst.derived, LIVE, ArithOp::Mul, 2);
-        let mut i = 0usize;
-        while i < LIVE {
-            assert_eq!(dst.derived[i], src.key_buf[i].wrapping_mul(2), "row {i}");
-            i += 1;
-        }
-        // Residue rows after two 1024 batches.
         assert_eq!(dst.derived[2048], 2049 * 2);
         assert_eq!(dst.derived[2049], 2050 * 2);
-
-        // Add path on a single partial chunk (no thread spawn → zero heap).
-        let mut out_add = RuntimeScratch::new_boxed();
-        execute_chunk_parallel(&src.key_buf, &mut out_add.derived, 17, ArithOp::Add, 5);
-        assert_eq!(out_add.derived[0], 6);
-        assert_eq!(out_add.derived[16], 22);
-
-        // --- B: full Tamil derive pipeline, zero hot-path heap ---
-        let q = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | கணி புதிய_விலை = விலை * 2 | வடி புதிய_விலை > 200;";
-        let catalog = demo_catalog();
-        assert!(catalog.orders.is_some());
-        let orders = catalog.orders.as_ref().unwrap();
-        assert_eq!(core::mem::align_of_val(orders.as_ref()), 64);
-        // derived_prices layout slot present on FixedOrdersDatabase.
-        assert_eq!(orders.derived_prices[0], orders.price_column[0]);
-
-        let mut arena = Box::new(AstArena::new());
-        let mut out = QueryResult::new_boxed();
-        let mut scratch = RuntimeScratch::new_boxed();
-        let mut tokens = alloc_token_window();
-        reset_counters();
-        set_tracking(true);
-        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
-        set_tracking(false);
-        assert_eq!(alloc_count(), 0);
-        assert_eq!(out.row_count, 11);
-        assert!(out.int_out[0].values[0] > 200);
     }
 
     /// Ω-QA-CORE-STRESS-STAGE3 — micro-arch checklist matrix (release-safe).
@@ -1109,5 +1041,523 @@ mod e2e_tests {
         set_tracking(false);
         assert_eq!(alloc_count(), 0, "GATE1 heap must stay 0");
         assert_eq!(out.row_count, 11);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Ω-CORE-PROD-VALIDATION-MATRIX — Tier A…E (exact production gate names)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// TIER A.1 — left-to-right lex + parse for a standard Tamil filter pipeline.
+    #[test]
+    fn test_basic_pipeline_lexing_and_parsing() {
+        let q = "இருந்து பயனர்கள் | வடி வயது > 21;";
+        let src = q.as_bytes();
+        let mut lex = Lexer::new(src);
+        let mut kinds = [TokenKind::Eof; 16];
+        let mut texts: [Option<&str>; 16] = [None; 16];
+        let mut n = 0usize;
+        loop {
+            let t = lex.next_token().expect("lex must succeed");
+            kinds[n] = t.kind;
+            texts[n] = t.text(src);
+            n += 1;
+            if t.kind == TokenKind::Eof || n >= 16 {
+                break;
+            }
+        }
+        assert_eq!(kinds[0], TokenKind::Irundu);
+        assert_eq!(kinds[1], TokenKind::Ident);
+        assert_eq!(texts[1], Some("பயனர்கள்"));
+        assert_eq!(kinds[2], TokenKind::Pipe);
+        assert_eq!(kinds[3], TokenKind::Vadi);
+        assert_eq!(kinds[4], TokenKind::Ident);
+        assert_eq!(kinds[5], TokenKind::Gt);
+        assert_eq!(kinds[6], TokenKind::Number);
+        assert_eq!(kinds[7], TokenKind::Semi);
+        assert_eq!(kinds[8], TokenKind::Eof);
+
+        let mut arena = Box::new(AstArena::new());
+        let mut tokens = alloc_token_window();
+        let root = parse_query(src, &mut arena, &mut tokens).expect("parse");
+        let pipe = arena.get(root).expect("root");
+        assert_eq!(pipe.kind, NodeKind::Pipeline);
+        let from = arena.get(pipe.left).expect("from");
+        assert_eq!(from.kind, NodeKind::From);
+        let filter = arena.get(from.next).expect("filter");
+        assert_eq!(filter.kind, NodeKind::Filter);
+        assert_eq!(filter.next, NIL);
+    }
+
+    /// TIER A.2 — ASCII structural delimiters map to packed TokenKind enums.
+    #[test]
+    fn test_all_structural_delimiters() {
+        let src = b"| = > < , ; * + -";
+        let mut lex = Lexer::new(src);
+        let expect = [
+            TokenKind::Pipe,
+            TokenKind::Eq,
+            TokenKind::Gt,
+            TokenKind::Lt,
+            TokenKind::Comma,
+            TokenKind::Semi,
+            TokenKind::Star,
+            TokenKind::Plus,
+            TokenKind::Minus,
+            TokenKind::Eof,
+        ];
+        let mut i = 0usize;
+        while i < expect.len() {
+            let t = lex.next_token().expect("delimiter lex");
+            assert_eq!(t.kind, expect[i], "delimiter index {i}");
+            i += 1;
+        }
+        // Register-density: TokenKind is a u8 discriminant.
+        assert_eq!(core::mem::size_of::<TokenKind>(), 1);
+    }
+
+    /// TIER B.3 — mid-syllable truncation → MalformedUtf8, never panic.
+    #[test]
+    fn test_grapheme_tearing_and_buffer_truncation() {
+        let full = "தே".as_bytes();
+        assert_eq!(full.len(), 6);
+        // Cut after 4 bytes: mid combining-vowel sequence.
+        let torn = &full[..4];
+        assert!(core::str::from_utf8(torn).is_err());
+        let mut lex = Lexer::new(torn);
+        let err = lex.next_token().expect_err("must reject torn தே");
+        assert_eq!(err, LexerError::MalformedUtf8(0));
+        assert_eq!(lex.last_error(), Some(LexerError::MalformedUtf8(0)));
+
+        // Streaming packet drops across "தேடு" mid-codepoint cuts.
+        let thedu = "தேடு".as_bytes();
+        let cuts = [1usize, 2, 4, 5, 7, 8, 10, 11];
+        let mut ci = 0usize;
+        while ci < cuts.len() {
+            let frag = &thedu[..cuts[ci]];
+            let mut lx = Lexer::new(frag);
+            match lx.next_token() {
+                Err(LexerError::MalformedUtf8(c)) => assert!((c as usize) <= cuts[ci]),
+                Err(LexerError::TokenBufferFull) => panic!("unexpected TokenBufferFull"),
+                Ok(t) => panic!("cut {} must not succeed: {t:?}", cuts[ci]),
+            }
+            let mut arena = Box::new(AstArena::new());
+            let mut tw = alloc_token_window();
+            assert_eq!(
+                parse_query(frag, &mut arena, &mut tw).unwrap_err(),
+                ParserError::LexMalformedUtf8
+            );
+            ci += 1;
+        }
+    }
+
+    /// TIER B.4 — maximal munch: "வடிவமைப்பு" stays Ident, bare "வடி" is Vadi.
+    #[test]
+    fn test_maximal_munch_keyword_collisions() {
+        let composite = "வடிவமைப்பு";
+        let mut lex = Lexer::new(composite.as_bytes());
+        let tok = lex.next_token().expect("lex composite");
+        assert_eq!(tok.kind, TokenKind::Ident);
+        assert_eq!(tok.text(composite.as_bytes()), Some("வடிவமைப்பு"));
+        assert_eq!(lex.next_token().unwrap().kind, TokenKind::Eof);
+
+        let mut lex2 = Lexer::new("வடி".as_bytes());
+        assert_eq!(lex2.next_token().unwrap().kind, TokenKind::Vadi);
+
+        // Pipeline using composite as column name must not tear into Vadi.
+        let q = "இருந்து பயனர்கள் | வடி வடிவமைப்பு > 1;";
+        let mut arena = Box::new(AstArena::new());
+        let mut tokens = alloc_token_window();
+        let root = parse_query(q.as_bytes(), &mut arena, &mut tokens).expect("parse");
+        let pipe = arena.get(root).unwrap();
+        let from = arena.get(pipe.left).unwrap();
+        let filter = arena.get(from.next).unwrap();
+        assert_eq!(filter.kind, NodeKind::Filter);
+        let bin = arena.get(filter.left).unwrap();
+        let col = arena.get(bin.left).unwrap();
+        assert_eq!(col.kind, NodeKind::Ident);
+        let name = &q.as_bytes()[col.start as usize..col.end as usize];
+        assert_eq!(name, "வடிவமைப்பு".as_bytes());
+    }
+
+    /// TIER B.5 — VT / FF / CR / LF / ZWSP flood isolated via WHITESPACE_LUT.
+    #[test]
+    fn test_chaotic_whitespace_injection() {
+        let mut buf = [0u8; 512];
+        let mut n = 0usize;
+        // Prefix: ASCII ws flood including VT (0x0B) and FF (0x0C).
+        let ascii = [b' ', b'\t', b'\n', b'\r', 0x0Bu8, 0x0Cu8];
+        let mut a = 0usize;
+        while a < 48 {
+            buf[n] = ascii[a % ascii.len()];
+            n += 1;
+            a += 1;
+        }
+        // ZWSP U+200B = E2 80 8B
+        let mut z = 0usize;
+        while z < 16 {
+            buf[n] = 0xE2;
+            buf[n + 1] = 0x80;
+            buf[n + 2] = 0x8B;
+            n += 3;
+            z += 1;
+        }
+        let body = "இருந்து பயனர்கள் | வடி வயது > 21;".as_bytes();
+        buf[n..n + body.len()].copy_from_slice(body);
+        n += body.len();
+        // Trailing chaos
+        buf[n] = 0x0B;
+        buf[n + 1] = b'\r';
+        buf[n + 2] = 0xE2;
+        buf[n + 3] = 0x80;
+        buf[n + 4] = 0x8B;
+        n += 5;
+        let stream = &buf[..n];
+
+        let mut lex = Lexer::new(stream);
+        assert_eq!(lex.next_token().unwrap().kind, TokenKind::Irundu);
+        assert_eq!(lex.next_token().unwrap().kind, TokenKind::Ident);
+        assert_eq!(lex.next_token().unwrap().kind, TokenKind::Pipe);
+        assert_eq!(lex.next_token().unwrap().kind, TokenKind::Vadi);
+
+        let mut arena = Box::new(AstArena::new());
+        let mut tokens = alloc_token_window();
+        assert!(parse_query(stream, &mut arena, &mut tokens).is_ok());
+
+        // Pure-ws stream → EmptyInput, never panic (complete ASCII ws only).
+        let ws_only = &buf[..48];
+        let mut lex_ws = Lexer::new(ws_only);
+        assert_eq!(lex_ws.next_token().unwrap().kind, TokenKind::Eof);
+        let mut arena2 = Box::new(AstArena::new());
+        let mut tw2 = alloc_token_window();
+        assert_eq!(
+            parse_query(ws_only, &mut arena2, &mut tw2).unwrap_err(),
+            ParserError::EmptyInput
+        );
+    }
+
+    /// TIER C.6 — 1024-node arena hard stop → ArenaOverflow (no OOB / panic).
+    #[test]
+    fn test_arena_overflow_prevention() {
+        let mut arena = AstArena::new();
+        let mut i = 0usize;
+        while i < AST_CAP {
+            let id = arena
+                .try_alloc(AstNode::empty())
+                .expect("slot within capacity");
+            assert_eq!(id as usize, i);
+            i += 1;
+        }
+        assert!(arena.is_full());
+        assert_eq!(arena.len as usize, AST_CAP);
+        let overflow = arena.try_alloc(AstNode::empty());
+        assert_eq!(overflow, Err(ParserError::ArenaOverflow));
+        assert_eq!(arena.len as usize, AST_CAP);
+
+        // Parse against saturated arena also returns ArenaOverflow.
+        let q = "இருந்து பயனர்கள் | வடி வயது > 21;";
+        let mut tokens = alloc_token_window();
+        let err = parse_query(q.as_bytes(), &mut arena, &mut tokens).unwrap_err();
+        assert_eq!(err, ParserError::ArenaOverflow);
+    }
+
+    /// TIER C.7 — stages before இருந்து → MissingSourceContext.
+    #[test]
+    fn test_out_of_order_pipeline_source() {
+        let cases: [&str; 4] = [
+            "வடி வயது > 21;",
+            "அடுக்கு வயது | எடு 10;",
+            "தேடு பெயர்;",
+            "இணை ஆர்டர்கள் | வடி வயது > 1;",
+        ];
+        let mut ci = 0usize;
+        while ci < cases.len() {
+            let mut arena = Box::new(AstArena::new());
+            let mut tokens = alloc_token_window();
+            let err = parse_query(cases[ci].as_bytes(), &mut arena, &mut tokens).unwrap_err();
+            assert_eq!(
+                err,
+                ParserError::MissingSourceContext,
+                "case {}",
+                cases[ci]
+            );
+            ci += 1;
+        }
+    }
+
+    /// TIER D.8 — 1→1500 asymmetric join multiplicity, forward-only emit.
+    #[test]
+    fn test_asymmetric_one_to_many_join_multiplicity() {
+        const RIGHT_DUP: usize = 1500;
+        let mut sc = RuntimeScratch::new_boxed();
+        sc.left_dense[0] = 42;
+        let mut r = 0usize;
+        while r < RIGHT_DUP {
+            sc.key_buf[r] = 42;
+            r += 1;
+        }
+        // Poison trailing keys to ensure we do not over-read.
+        sc.key_buf[RIGHT_DUP] = 99;
+        sc.key_buf[RIGHT_DUP + 1] = 7;
+
+        let n = vector_merge_join(
+            &sc.left_dense,
+            1,
+            &sc.key_buf,
+            RIGHT_DUP,
+            &mut sc.join_left,
+            &mut sc.join_right,
+            &mut sc.left_order,
+            &mut sc.right_order,
+            &mut sc.tmp_u16,
+        );
+        assert_eq!(n, RIGHT_DUP);
+        let mut i = 0usize;
+        while i < n {
+            assert_eq!(sc.join_left[i], 0);
+            assert_eq!(sc.key_buf[sc.join_right[i] as usize], 42);
+            // Constant-forward: right indices from the sorted equal-run are unique.
+            i += 1;
+        }
+        // All right row ids appear exactly once.
+        let mut seen = [0u8; 2048];
+        let mut i = 0usize;
+        while i < n {
+            let rid = sc.join_right[i] as usize;
+            assert!(rid < RIGHT_DUP);
+            assert_eq!(seen[rid], 0, "duplicate emit / backtrack at {rid}");
+            seen[rid] = 1;
+            i += 1;
+        }
+    }
+
+    /// TIER D.9 — disjoint key domains → O(1) sparsity fast-abort (0 matches).
+    #[test]
+    fn test_constant_time_sparsity_fast_abort() {
+        let mut sc = RuntimeScratch::new_boxed();
+        // Left: 0..100, Right: 5000..5100 — no overlap.
+        let mut i = 0usize;
+        while i < 100 {
+            sc.left_dense[i] = i as i64;
+            i += 1;
+        }
+        let mut j = 0usize;
+        while j < 100 {
+            sc.key_buf[j] = 5000 + (j as i64);
+            j += 1;
+        }
+        let n = vector_merge_join(
+            &sc.left_dense,
+            100,
+            &sc.key_buf,
+            100,
+            &mut sc.join_left,
+            &mut sc.join_right,
+            &mut sc.left_order,
+            &mut sc.right_order,
+            &mut sc.tmp_u16,
+        );
+        assert_eq!(n, 0, "disjoint domains must fast-abort to zero matches");
+
+        // Boundary touch: left max == right min − 1 still disjoint.
+        sc.left_dense[0] = 4999;
+        sc.key_buf[0] = 5000;
+        let n2 = vector_merge_join(
+            &sc.left_dense,
+            1,
+            &sc.key_buf,
+            1,
+            &mut sc.join_left,
+            &mut sc.join_right,
+            &mut sc.left_order,
+            &mut sc.right_order,
+            &mut sc.tmp_u16,
+        );
+        assert_eq!(n2, 0);
+
+        // Adjacent equal keys must NOT abort.
+        sc.left_dense[0] = 5000;
+        let n3 = vector_merge_join(
+            &sc.left_dense,
+            1,
+            &sc.key_buf,
+            1,
+            &mut sc.join_left,
+            &mut sc.join_right,
+            &mut sc.left_order,
+            &mut sc.right_order,
+            &mut sc.tmp_u16,
+        );
+        assert_eq!(n3, 1);
+    }
+
+    /// TIER E.10 — 2050-row remainder: 2×1024 batches + 2-row scalar tail.
+    #[test]
+    fn test_simd_unaligned_tail_residue_fidelity() {
+        const LIVE: usize = 2050;
+        assert_eq!(LIVE / BATCH_ROWS, 2);
+        assert_eq!(LIVE % BATCH_ROWS, 2);
+
+        let mut sc = RuntimeScratch::new_boxed();
+        let mut i = 0usize;
+        while i < LIVE {
+            sc.key_buf[i] = i as i64;
+            i += 1;
+        }
+        // Sentinel past live window — must not be clobbered.
+        if LIVE < MAX_ROWS {
+            sc.key_buf[LIVE] = -1;
+        }
+        let mut sel = SelectionVector::all(LIVE);
+        if LIVE < MAX_ROWS {
+            sel.mask[LIVE] = 0xA5;
+        }
+        Engine::filter_i64_gt(&sc.key_buf, &mut sel, LIVE, 2047);
+        assert_eq!(sel.mask[2047], 0);
+        assert_eq!(sel.mask[2048], 1);
+        assert_eq!(sel.mask[2049], 1);
+        if LIVE < MAX_ROWS {
+            assert_eq!(sel.mask[LIVE], 0xA5, "SIMD must not serialize past live");
+        }
+
+        let mut order_len = 0usize;
+        Engine::sort_i64_selected(
+            &sc.key_buf,
+            &sel,
+            LIVE,
+            &mut sc.order,
+            &mut order_len,
+            &mut sc.tmp_u16,
+        );
+        assert_eq!(order_len, 2);
+        assert_eq!(sc.order[0], 2048);
+        assert_eq!(sc.order[1], 2049);
+
+        // Derive chunk router residue on the same 2050 window.
+        execute_chunk_parallel(&sc.key_buf, &mut sc.derived, LIVE, ArithOp::Add, 10);
+        assert_eq!(sc.derived[0], 10);
+        assert_eq!(sc.derived[2048], 2058);
+        assert_eq!(sc.derived[2049], 2059);
+        if LIVE < MAX_ROWS {
+            assert_eq!(sc.key_buf[LIVE], -1);
+        }
+    }
+
+    /// TIER E.11 — 1024-row chunk distribution via ENGINE_SCRATCH_PAD, zero heap.
+    #[test]
+    fn test_parallel_chunk_distribution_integrity() {
+        const LIVE: usize = 2050;
+        let mut src = RuntimeScratch::new_boxed();
+        let mut dst = RuntimeScratch::new_boxed();
+        let mut i = 0usize;
+        while i < LIVE {
+            src.key_buf[i] = (i as i64) + 1;
+            i += 1;
+        }
+        reset_counters();
+        set_tracking(true);
+        execute_chunk_parallel(&src.key_buf, &mut dst.derived, LIVE, ArithOp::Mul, 2);
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0, "chunk TLS path must not allocate");
+        let mut i = 0usize;
+        while i < LIVE {
+            assert_eq!(dst.derived[i], src.key_buf[i].wrapping_mul(2), "row {i}");
+            i += 1;
+        }
+        assert_eq!(dst.derived[2048], 2049 * 2);
+        assert_eq!(dst.derived[2049], 2050 * 2);
+
+        // Single partial chunk (no multi-batch) still zero-heap.
+        let mut out_add = RuntimeScratch::new_boxed();
+        reset_counters();
+        set_tracking(true);
+        execute_chunk_parallel(&src.key_buf, &mut out_add.derived, 17, ArithOp::Add, 5);
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0);
+        assert_eq!(out_add.derived[0], 6);
+        assert_eq!(out_add.derived[16], 22);
+
+        // Full Tamil derive pipeline under the same zero-heap lock.
+        let q = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | கணி புதிய_விலை = விலை * 2 | வடி புதிய_விலை > 200;";
+        let catalog = demo_catalog();
+        assert!(catalog.orders.is_some());
+        let orders = catalog.orders.as_ref().unwrap();
+        assert_eq!(core::mem::align_of_val(orders.as_ref()), 64);
+        assert_eq!(orders.derived_prices[0], orders.price_column[0]);
+
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        reset_counters();
+        set_tracking(true);
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0);
+        assert_eq!(out.row_count, 11);
+        assert!(out.int_out[0].values[0] > 200);
+    }
+
+    /// TIER E.12 — full `கணி` derive math pipeline with raw derived buffer writes.
+    #[test]
+    fn test_derive_math_pipeline_evaluation() {
+        let q = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | கணி புதிய_விலை = விலை * 2 | வடி புதிய_விலை > 200;";
+
+        let mut lex = Lexer::new(q.as_bytes());
+        let mut saw_kani = false;
+        let mut saw_star = false;
+        loop {
+            match lex.next_token() {
+                Ok(t) if t.kind == TokenKind::Eof => break,
+                Ok(t) if t.kind == TokenKind::Kani => {
+                    assert_eq!(t.text(q.as_bytes()), Some("கணி"));
+                    saw_kani = true;
+                }
+                Ok(t) if t.kind == TokenKind::Star => saw_star = true,
+                Ok(_) => {}
+                Err(e) => panic!("lex fault: {e:?}"),
+            }
+        }
+        assert!(saw_kani);
+        assert!(saw_star);
+
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        reset_counters();
+        set_tracking(true);
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        set_tracking(false);
+        assert_eq!(alloc_count(), 0, "derive hot path must not allocate");
+        assert_eq!(scratch.has_derived, 1);
+        assert_eq!(scratch.derived_name.as_bytes(), "புதிய_விலை".as_bytes());
+
+        // Raw pointer address view into derived slab (no copy / no alloc).
+        let derived_ptr: *mut i64 = scratch.derived.as_mut_ptr();
+        assert!(!derived_ptr.is_null());
+        // price*2 > 200 ⇒ price > 100; seeded 100 drops → 11 rows.
+        assert_eq!(out.col_count, 1);
+        assert_eq!(out.row_count, 11);
+        let mut i = 0usize;
+        while i < out.row_count as usize {
+            let v = out.int_out[0].values[i];
+            assert!(v > 200);
+            assert_eq!(v % 2, 0);
+            // Cross-check against scratch.derived via order slots when present.
+            i += 1;
+        }
+        // Direct slab probe: at least one join slot holds a doubled price.
+        let mut found = false;
+        let mut s = 0usize;
+        while s < MAX_ROWS {
+            let v = unsafe { *derived_ptr.add(s) };
+            if v > 200 && v % 2 == 0 {
+                found = true;
+                break;
+            }
+            s += 1;
+        }
+        assert!(found, "derived slab must hold computed *mut i64 values");
     }
 }
