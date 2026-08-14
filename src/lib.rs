@@ -1567,6 +1567,7 @@ mod e2e_tests {
 
     /// STAGE-4 v2: mmap page stream over 10_000 rows using OS page-size chunking.
     #[test]
+    #[cfg_attr(miri, ignore = "memmap2 file-backed mmap unsupported under Miri")]
     fn test_persistent_mmap_page_streaming_fidelity() {
         const TOTAL: usize = 10_000;
         let page_rows = os_page_size_bytes() / 8;
@@ -1665,6 +1666,7 @@ mod e2e_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "memmap2 file-backed mmap unsupported under Miri")]
     fn test_mmap_page_streaming_10000_rows_exact_remainder() {
         const TOTAL: usize = 10_000;
         let dir = std::env::temp_dir().join("tamil_mmap_10000_remainder");
@@ -1693,6 +1695,7 @@ mod e2e_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "memmap2 file-backed mmap unsupported under Miri")]
     fn test_mmap_missing_file_returns_io_error_not_panic() {
         let path = std::path::Path::new("/tmp/tamil_query_engine_missing_column_file_zzz.bin");
         let err = ColumnarFileStream::open_i64(path)
@@ -1732,5 +1735,169 @@ mod e2e_tests {
             "expected ColumnNotFound, got {col_err:?}"
         );
         assert!(!matches!(col_err, Err(EngineError::ParseFailed)));
+    }
+
+    /// 1.1: public constructors must be heap-only — survive a stack smaller
+    /// than `size_of::<Table>()` (267 520). Documented safe minimum for the
+    /// boxed path: 256 KiB. The pre-fix `Table::new` / `QueryResult::new`
+    /// aborted with stack overflow at 64 KiB (EXIT 134) — see audit log.
+    #[test]
+    fn test_boxed_constructors_survive_constrained_stack() {
+        const STACK: usize = 256 * 1024;
+        assert!(STACK < 267_520, "stack must stay below Table stack footprint");
+        let handle = std::thread::Builder::new()
+            .stack_size(STACK)
+            .name("boxed-ctors".into())
+            .spawn(|| {
+                let t = Table::new_boxed(b"x");
+                let q = QueryResult::new_boxed();
+                assert_eq!(t.col_count, 0);
+                assert_eq!(q.row_count, 0);
+                let mut cat = Catalog::new();
+                assert!(cat.register(t).is_some());
+                core::hint::black_box(q);
+            })
+            .expect("spawn");
+        handle
+            .join()
+            .expect("boxed constructors must not overflow a 256KiB stack");
+    }
+
+    /// 1.2: Filter.stage.left is BinOp — full pipeline e2e (not an isolated unit).
+    /// Would fail if execute treated Filter.left as a column Ident.
+    #[test]
+    fn test_filter_binop_shape_full_pipeline_e2e() {
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        let q = "இருந்து பயனர்கள் | வடி வயது > 21 | தேடு வயது;";
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
+        assert!(out.row_count > 0);
+        // Structural proof: Filter.left is BinOp, BinOp.left is Ident.
+        let root = arena.get(arena.root).unwrap();
+        let mut stage = root.left;
+        let mut saw_filter = false;
+        while stage != NIL {
+            let n = arena.get(stage).unwrap();
+            if n.kind == NodeKind::Filter {
+                let bin = arena.get(n.left).unwrap();
+                assert_eq!(bin.kind, NodeKind::BinOp);
+                let col = arena.get(bin.left).unwrap();
+                assert_eq!(col.kind, NodeKind::Ident);
+                saw_filter = true;
+            }
+            stage = n.next;
+        }
+        assert!(saw_filter);
+    }
+
+    /// 2.7: zero-heap proof across demo / join / mmap page walk / malformed.
+    #[test]
+    #[cfg_attr(miri, ignore = "memmap2 file-backed mmap unsupported under Miri")]
+    fn test_zero_heap_expanded_entry_points() {
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+
+        reset_counters();
+        set_tracking(true);
+        let _ = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens);
+        set_tracking(false);
+        let demo_allocs = alloc_count();
+        assert_eq!(demo_allocs, 0, "DEMO_QUERY hot path allocs={demo_allocs}");
+
+        let join_q =
+            "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | வடி விலை > 100 | தேடு விலை;";
+        reset_counters();
+        set_tracking(true);
+        let _ = run_query(join_q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens);
+        set_tracking(false);
+        let join_allocs = alloc_count();
+        assert_eq!(join_allocs, 0, "join pipeline allocs={join_allocs}");
+
+        let bad = "@@@not-a-query;;;";
+        reset_counters();
+        set_tracking(true);
+        let _ = run_query(bad, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens);
+        set_tracking(false);
+        let bad_allocs = alloc_count();
+        assert_eq!(bad_allocs, 0, "malformed query allocs={bad_allocs}");
+
+        let dir = std::env::temp_dir().join("tamil_zero_heap_mmap");
+        let _ = std::fs::create_dir_all(&dir);
+        write_i64_column_bin(&dir.join("ages.bin"), 2_000, |i| i as i64).unwrap();
+        let mut stream = ColumnarFileStream::open_i64(&dir.join("ages.bin")).unwrap();
+        reset_counters();
+        set_tracking(true);
+        let mut sum = 0usize;
+        while let Some(c) = stream.next_page_chunk() {
+            sum += c.row_count as usize;
+        }
+        set_tracking(false);
+        assert_eq!(sum, 2_000);
+        let mmap_allocs = alloc_count();
+        assert_eq!(mmap_allocs, 0, "mmap page walk allocs={mmap_allocs}");
+    }
+
+    /// 2.9-ish: exercise distinct EngineError return paths through run_query.
+    #[test]
+    fn test_execute_error_paths_coverage_smoke() {
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+
+        // missing table
+        let e = run_query(
+            "இருந்து இல்லாதஅட்டவணை | தேடு வயது;",
+            &catalog,
+            &mut arena,
+            &mut out,
+            &mut scratch,
+            &mut tokens,
+        );
+        assert!(matches!(e, Err(EngineError::ColumnNotFound { .. })));
+
+        // missing filter column
+        let e = run_query(
+            "இருந்து பயனர்கள் | வடி இல்லாதநெடுவரிசை > 1 | தேடு வயது;",
+            &catalog,
+            &mut arena,
+            &mut out,
+            &mut scratch,
+            &mut tokens,
+        );
+        assert!(matches!(e, Err(EngineError::ColumnNotFound { .. })));
+
+        // missing sort column
+        let e = run_query(
+            "இருந்து பயனர்கள் | அடுக்கு இல்லாதநெடுவரிசை | தேடு வயது;",
+            &catalog,
+            &mut arena,
+            &mut out,
+            &mut scratch,
+            &mut tokens,
+        );
+        assert!(matches!(e, Err(EngineError::ColumnNotFound { .. })));
+
+        // missing project column (known CLI case)
+        let e = run_query(
+            "இருந்து பயனர்கள் | தேடு இல்லாதநெடுவரிசை;",
+            &catalog,
+            &mut arena,
+            &mut out,
+            &mut scratch,
+            &mut tokens,
+        );
+        assert!(matches!(e, Err(EngineError::ColumnNotFound { .. })));
+
+        // parse failure
+        let e = run_query("| | |;", &catalog, &mut arena, &mut out, &mut scratch, &mut tokens);
+        assert!(matches!(e, Err(EngineError::ParseFailed)));
     }
 }

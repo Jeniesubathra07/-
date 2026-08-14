@@ -6,6 +6,13 @@
 //!
 //! Catalog registration may box tables once (cold path). Query execution loops
 //! never call `alloc`, `Vec`, `String`, or `clone`.
+//!
+//! # Platform contract (Stage-4 persistence)
+//! On-disk Int64 payloads are **little-endian** `i64` bytes. `os_page_size_bytes`
+//! uses POSIX `sysconf(_SC_PAGESIZE)` under `#[cfg(unix)]` with a 4096 fallback.
+//! Windows page-size / big-endian hosts are **not** verified in this environment
+//! (x86_64 Linux only was executed). Mmap readers assume a single-writer-absent
+//! snapshot — see SIGBUS hazard docs on every public `open*` method.
 
 use core::ptr;
 
@@ -211,10 +218,14 @@ impl Utf8Column {
             return false;
         }
         let start = self.data_len as usize;
-        let end = start + bytes.len();
+        let end = match start.checked_add(bytes.len()) {
+            Some(e) => e,
+            None => return false,
+        };
         if end > UTF8_SLAB_CAP {
             return false;
         }
+        // Truncating casts are safe: end <= UTF8_SLAB_CAP fits in u32.
         self.data[start..end].copy_from_slice(bytes);
         self.offsets[row] = start as u32;
         self.offsets[row + 1] = end as u32;
@@ -278,28 +289,11 @@ const _: () = assert!(core::mem::align_of::<Int64Column>() == 64);
 const _: () = assert!(core::mem::align_of::<Utf8Column>() == 64);
 
 impl Table {
-    pub fn new(name: &[u8]) -> Self {
-        Self {
-            name: ColName::from_bytes(name),
-            col_meta: [ColumnMeta::empty(); MAX_COLUMNS],
-            col_count: 0,
-            row_count: 0,
-            _pad: [0; 4],
-            columns: [
-                ColumnData::Null,
-                ColumnData::Null,
-                ColumnData::Null,
-                ColumnData::Null,
-                ColumnData::Null,
-                ColumnData::Null,
-                ColumnData::Null,
-                ColumnData::Null,
-            ],
-        }
-    }
-
-    /// Cold-path heap construction — avoids placing a multi-hundred-KB `Table`
-    /// temporary on the caller's stack frame.
+    /// Cold-path heap construction — the only supported public constructor.
+    ///
+    /// `size_of::<Table>() == 267_520`. There is intentionally no stack `new()`
+    /// / `Default` path: constructing or moving `Table` by value overflows
+    /// constrained stacks (verified: 64 KiB thread → stack overflow / EXIT 134).
     pub fn new_boxed(name: &[u8]) -> Box<Self> {
         use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
         unsafe {
@@ -475,8 +469,10 @@ impl Catalog {
         }
     }
 
-    pub fn register(&mut self, table: Table) -> Option<usize> {
-        self.register_box(Box::new(table))
+    /// Register a heap-allocated table. Takes `Box<Table>` so callers never
+    /// materialize a 267 KB `Table` by-value on the stack.
+    pub fn register(&mut self, table: Box<Table>) -> Option<usize> {
+        self.register_box(table)
     }
 
     pub fn register_box(&mut self, table: Box<Table>) -> Option<usize> {
@@ -832,6 +828,11 @@ pub struct Utf8ColumnFile {
 
 impl Utf8ColumnFile {
     /// Cold-path open of `.offsets` + `.blob` (+ optional `.meta` validation).
+    ///
+    /// # Hard precondition (SIGBUS hazard)
+    /// Both mappings are READ-ONLY single-writer-absent snapshots. Truncating,
+    /// deleting, or replacing either file while this value is live can deliver
+    /// `SIGBUS` on the next access — not a Rust `Result::Err`.
     pub fn open(offsets_path: &Path, blob_path: &Path, meta_path: Option<&Path>) -> io::Result<Self> {
         let off_file = File::open(offsets_path)?;
         let blob_file = File::open(blob_path)?;
@@ -973,7 +974,7 @@ fn pad_to_page(file: &mut File, page_size: usize) -> io::Result<()> {
         return Ok(());
     }
     let mut left = page_size - rem;
-    let mut chunk = [0u8; 512];
+    let chunk = [0u8; 512];
     while left > 0 {
         let n = left.min(chunk.len());
         file.write_all(&chunk[..n])?;
@@ -1030,17 +1031,34 @@ pub struct ColumnarFileStream {
 
 impl ColumnarFileStream {
     /// Cold-path: open + mmap a raw Int64 `.bin` (optional companion `.meta`).
+    ///
+    /// # Hard precondition (SIGBUS hazard)
+    /// The returned mapping is READ-ONLY and assumes a **single-writer-absent
+    /// snapshot**: the backing file must not be truncated, deleted, or replaced
+    /// for the lifetime of this stream. Violating that precondition can deliver
+    /// `SIGBUS` on access — a process-level signal, **not** a Rust `Result::Err`.
     pub fn open_i64(path: &Path) -> io::Result<Self> {
         let meta_path = path.with_extension("meta");
-        let meta = if meta_path.exists() {
-            Some(read_int64_meta(&meta_path)?)
-        } else {
-            None
+        let meta = match File::open(&meta_path) {
+            Ok(mut f) => {
+                let mut buf = [0u8; 8];
+                use std::io::Read;
+                f.read_exact(&mut buf)?;
+                Some(Int64ColumnMeta {
+                    row_count: u64::from_le_bytes(buf),
+                })
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
         };
         Self::open_i64_inner(path, meta)
     }
 
     /// Cold-path open with explicit `.meta` validation (row_count must match).
+    ///
+    /// # Hard precondition (SIGBUS hazard)
+    /// Same as [`ColumnarFileStream::open_i64`]: do not mutate the backing file
+    /// for the lifetime of the returned mapping.
     pub fn open_i64_with_meta(bin_path: &Path, meta_path: &Path) -> io::Result<Self> {
         let meta = read_int64_meta(meta_path)?;
         Self::open_i64_inner(bin_path, Some(meta))
@@ -1135,14 +1153,28 @@ impl ColumnarFileStream {
         }
         let remaining = self.total_rows - self.cursor_row;
         let n = remaining.min(self.page_rows);
-        let byte_off = self.cursor_row.wrapping_mul(self.row_width);
-        let byte_len = n.wrapping_mul(self.row_width);
-        let end = byte_off.wrapping_add(byte_len);
+        let byte_off = match self.cursor_row.checked_mul(self.row_width) {
+            Some(o) => o,
+            None => return None,
+        };
+        let byte_len = match n.checked_mul(self.row_width) {
+            Some(l) => l,
+            None => return None,
+        };
+        let end = match byte_off.checked_add(byte_len) {
+            Some(e) => e,
+            None => return None,
+        };
         if end > self.mmap.len() {
             return None;
         }
         let bytes = &self.mmap[byte_off..end];
-        // SAFETY: length is a multiple of row_width (8); view is within the map.
+        // SAFETY: (1) `n * row_width` bytes with `row_width == 8`; (2) mmap base
+        // is OS-page-aligned and page size is a multiple of 8 on POSIX, so
+        // `byte_off` (multiple of 8) yields an 8-byte-aligned `i64` pointer;
+        // (3) length covers exactly `n` i64 elements within the mapped region.
+        // Verified under Miri with isolation disabled on x86_64 Linux.
+        debug_assert_eq!(bytes.as_ptr() as usize % core::mem::align_of::<i64>(), 0);
         let rows: &[i64] =
             unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const i64, n) };
         let page_index = if self.page_rows == 0 {
@@ -1329,18 +1361,35 @@ pub fn write_utf8_column_files(
 ) -> io::Result<()> {
     let mut off_file = File::create(offsets_path)?;
     let mut blob_file = File::create(blob_path)?;
-    let mut blob_len = 0u32;
+    let mut blob_len: u32 = 0;
     let mut i = 0usize;
     while i < rows.len() {
         let s = rows[i];
+        let len_u32 = match u32::try_from(s.len()) {
+            Ok(l) => l,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "utf8 row longer than u32::MAX",
+                ))
+            }
+        };
         let entry = Utf8OffsetEntry {
             offset: blob_len,
-            length: s.len() as u32,
+            length: len_u32,
         };
         off_file.write_all(&entry.offset.to_le_bytes())?;
         off_file.write_all(&entry.length.to_le_bytes())?;
         blob_file.write_all(s)?;
-        blob_len = blob_len.wrapping_add(s.len() as u32);
+        blob_len = match blob_len.checked_add(len_u32) {
+            Some(v) => v,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "utf8 blob length overflow",
+                ))
+            }
+        };
         i += 1;
     }
     pad_to_page(&mut off_file, os_page_size_bytes())?;
@@ -1384,6 +1433,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "memmap2 file-backed mmap unsupported under Miri")]
     fn test_mmap_page_streaming_10000_rows_exact_remainder() {
         const TOTAL: usize = 10_000;
         let dir = std::env::temp_dir().join("tamil_mmap_page_stream_v2");
@@ -1421,6 +1471,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "memmap2 file-backed mmap unsupported under Miri")]
     fn columnar_file_stream_pages_10000() {
         // Compatibility wrapper: same geometry as the named Stage-4 v2 test.
         const TOTAL: usize = 10_000;
@@ -1444,6 +1495,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "memmap2 file-backed mmap unsupported under Miri")]
     fn utf8_column_file_offset_blob_roundtrip() {
         let dir = std::env::temp_dir().join("tamil_utf8_col_v2");
         let _ = std::fs::create_dir_all(&dir);

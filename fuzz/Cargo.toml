@@ -1,0 +1,24 @@
+[package]
+name = "tamil_query_engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tamil_query_engine = { path = ".." }
+
+[[bin]]
+name = "fuzz_run_query"
+path = "fuzz_targets/fuzz_run_query.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_columnar_files"
+path = "fuzz_targets/fuzz_columnar_files.rs"
+test = false
+doc = false

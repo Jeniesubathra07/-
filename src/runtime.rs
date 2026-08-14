@@ -105,38 +105,12 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
-    pub fn new() -> Self {
-        Self {
-            schema: [ColumnMeta::empty(); MAX_PROJECT],
-            col_count: 0,
-            row_count: 0,
-            _pad: [0; 4],
-            int_out: [
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-            ],
-            utf8_out: [
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-            ],
-            types: [PhysType::Null; MAX_PROJECT],
-            live: [0; MAX_PROJECT],
-        }
-    }
-
-    /// Cold-path heap construction for large columnar result buffers.
+    /// Cold-path heap construction for large columnar result buffers —
+    /// the only supported public constructor.
+    ///
+    /// `size_of::<QueryResult>() == 468_224`. No stack `new()` / `Default` impl:
+    /// those paths overflow constrained stacks and would make
+    /// `unwrap_or_default()` silently allocate ~0.5 MiB on the stack.
     pub fn new_boxed() -> Box<Self> {
         use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
         unsafe {
@@ -158,12 +132,6 @@ impl QueryResult {
             }
             Box::from_raw(ptr)
         }
-    }
-}
-
-impl Default for QueryResult {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -820,13 +788,43 @@ impl<'a> Engine<'a> {
     }
 
     #[inline(always)]
-    fn ident_bytes(&self, node: &AstNode) -> &'a [u8] {
+    fn src_span_bytes(&self, node: &AstNode) -> &'a [u8] {
         let s = node.start as usize;
         let e = node.end as usize;
         if e <= self.src.len() && s <= e {
             &self.src[s..e]
         } else {
             &[]
+        }
+    }
+
+    #[inline(always)]
+    fn ident_bytes(&self, node: &AstNode) -> &'a [u8] {
+        debug_assert_eq!(
+            node.kind,
+            NodeKind::Ident,
+            "ident_bytes requires NodeKind::Ident; got {:?}",
+            node.kind
+        );
+        self.src_span_bytes(node)
+    }
+
+    /// Require `node.kind == Ident` before reading source bytes (AST-shape guard).
+    #[inline(always)]
+    fn expect_ident_bytes(&self, node: &AstNode) -> Result<&'a [u8], EngineError> {
+        if node.kind != NodeKind::Ident {
+            return Err(EngineError::ParseFailed);
+        }
+        Ok(self.src_span_bytes(node))
+    }
+
+    /// Projection list head is retagged [`NodeKind::ColumnList`] by the parser
+    /// but still carries the first Ident's source span; subsequent nodes are Ident.
+    #[inline(always)]
+    fn expect_projection_name_bytes(&self, node: &AstNode) -> Result<&'a [u8], EngineError> {
+        match node.kind {
+            NodeKind::Ident | NodeKind::ColumnList => Ok(self.src_span_bytes(node)),
+            _ => Err(EngineError::ParseFailed),
         }
     }
 
@@ -911,6 +909,9 @@ impl<'a> Engine<'a> {
             Some(n) => n,
             None => return Err(EngineError::ParseFailed),
         };
+        if left.kind != NodeKind::Ident {
+            return Err(EngineError::ParseFailed);
+        }
         let col_name = self.ident_bytes(left);
         let col = match table.find_column(col_name) {
             Some(c) => c,
@@ -969,7 +970,10 @@ impl<'a> Engine<'a> {
                 Some(n) => n,
                 None => break,
             };
-            let name = self.ident_bytes(node);
+            if node.kind != NodeKind::Ident && node.kind != NodeKind::ColumnList {
+                return Err(EngineError::ParseFailed);
+            }
+            let name = self.expect_projection_name_bytes(node)?;
             if scratch.has_derived != 0 && scratch.derived_name.eq_bytes(name) {
                 col_ids[nproj] = usize::MAX;
                 col_side[nproj] = 2;
@@ -1105,7 +1109,7 @@ impl<'a> Engine<'a> {
                         Some(n) => n,
                         None => return Err(EngineError::ParseFailed),
                     };
-                    let table_name = self.ident_bytes(ident);
+                    let table_name = self.expect_ident_bytes(ident)?;
                     let table = match self.catalog.find(table_name) {
                         Some(t) => t,
                         None => {
@@ -1137,7 +1141,7 @@ impl<'a> Engine<'a> {
                         Some(n) => n,
                         None => return Err(EngineError::ParseFailed),
                     };
-                    let right_name = self.ident_bytes(rel);
+                    let right_name = self.expect_ident_bytes(rel)?;
                     let right = match self.catalog.find(right_name) {
                         Some(t) => t,
                         None => {
@@ -1229,6 +1233,10 @@ impl<'a> Engine<'a> {
                         Some(n) => n,
                         None => return Err(EngineError::ParseFailed),
                     };
+                    // Filter.stage.left is BinOp; column Ident is BinOp.left — not stage.left.
+                    if bin.kind != NodeKind::BinOp {
+                        return Err(EngineError::ParseFailed);
+                    }
                     let left_ast = match arena.get(bin.left) {
                         Some(n) => n,
                         None => return Err(EngineError::ParseFailed),
@@ -1237,7 +1245,7 @@ impl<'a> Engine<'a> {
                         Some(n) => n,
                         None => return Err(EngineError::ParseFailed),
                     };
-                    let col_name = self.ident_bytes(left_ast);
+                    let col_name = self.expect_ident_bytes(left_ast)?;
                     let lit = right_ast.value;
                     let filter_n = if joined { join_len } else { active_rows };
 
@@ -1351,7 +1359,7 @@ impl<'a> Engine<'a> {
                         Some(n) => n,
                         None => return Err(EngineError::ParseFailed),
                     };
-                    let col_name = self.ident_bytes(col_node);
+                    let col_name = self.expect_ident_bytes(col_node)?;
                     let col = match table.find_column(col_name) {
                         Some(c) => c,
                         None => {
@@ -1562,6 +1570,9 @@ impl<'a> Engine<'a> {
             Some(n) => n,
             None => return false,
         };
+        if target.kind != NodeKind::Ident {
+            return false;
+        }
         let n = if joined { join_len } else { active_rows }.min(MAX_ROWS);
         scratch.derived_name = ColName::from_bytes(self.ident_bytes(target));
         scratch.has_derived = 1;
