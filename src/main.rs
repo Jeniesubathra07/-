@@ -3,7 +3,7 @@
 use std::env;
 use std::process;
 use tamil_query_engine::{
-    alloc_token_window, demo_catalog, run_query, AstArena, PhysType, QueryResult,
+    alloc_token_window, demo_catalog, run_query, AstArena, EngineError, PhysType, QueryResult,
     RuntimeScratch, DEMO_QUERY,
 };
 
@@ -20,8 +20,19 @@ fn main() {
     let mut scratch = RuntimeScratch::new_boxed();
     let mut tokens = alloc_token_window();
 
-    if !run_query(&query, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens) {
-        eprintln!("error: failed to parse or execute query");
+    if let Err(e) = run_query(&query, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens) {
+        match e {
+            EngineError::ParseFailed => eprintln!("error: ParseFailed"),
+            EngineError::ColumnNotFound { table, column } => {
+                let t = core::str::from_utf8(trim_z(&table)).unwrap_or("?");
+                let c = core::str::from_utf8(trim_z(&column)).unwrap_or("?");
+                eprintln!("error: ColumnNotFound {{ table: {t}, column: {c} }}");
+            }
+            EngineError::IoError => eprintln!("error: IoError"),
+            EngineError::PageCorrupt { page_index } => {
+                eprintln!("error: PageCorrupt {{ page_index: {page_index} }}");
+            }
+        }
         eprintln!("query: {query}");
         process::exit(1);
     }
@@ -53,7 +64,6 @@ fn main() {
                     print!("{s}");
                 }
                 PhysType::Bool => {
-                    // Bool columns are not projected by the demo path; keep CLI complete.
                     print!("?");
                 }
                 PhysType::Null => print!("NULL"),
@@ -63,4 +73,12 @@ fn main() {
         println!();
         r += 1;
     }
+}
+
+fn trim_z(buf: &[u8]) -> &[u8] {
+    let mut n = 0usize;
+    while n < buf.len() && buf[n] != 0 {
+        n += 1;
+    }
+    &buf[..n]
 }

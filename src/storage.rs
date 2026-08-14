@@ -748,13 +748,241 @@ pub unsafe fn memcpy_bytes(dst: *mut u8, src: *const u8, len: usize) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Stage-4 — zero-allocation columnar disk persistence (mmap page stream)
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// READ-ONLY single-writer-absent snapshots: ingest happens once via a cold-path
+// tool; query-time mmap readers assume no concurrent writers. Concurrent-writer
+// safety is intentionally out of scope for this stage.
+//
+// memmap2 maps pages via the OS virtual-memory subsystem — not `std::alloc`.
+// Accessing mapped bytes is a load from an OS mapping, not a `Vec`/`Box`/`String`
+// allocation, so hot-path page walks preserve the no-heap invariant.
 
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
-/// One memory-mapped page window over an Int64 column file.
+/// POSIX `_SC_PAGESIZE` (Linux). Declared locally so we do not add a `libc` crate.
+#[cfg(unix)]
+const _SC_PAGESIZE: i32 = 30;
+
+#[cfg(unix)]
+extern "C" {
+    fn sysconf(name: i32) -> i64;
+}
+
+/// Real OS page size in bytes (`sysconf(_SC_PAGESIZE)`).
+///
+/// Page chunking for fixed-width columns derives
+/// `page_rows = page_size_bytes / row_width_bytes` — never a hardcoded row count.
+#[inline(always)]
+pub fn os_page_size_bytes() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf(_SC_PAGESIZE) is defined on POSIX and returns > 0.
+        let p = unsafe { sysconf(_SC_PAGESIZE) };
+        if p > 0 {
+            return p as usize;
+        }
+    }
+    4096
+}
+
+/// Ingest-time `.meta` companion for an Int64 `.bin` column (written once).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Int64ColumnMeta {
+    pub row_count: u64,
+}
+
+/// On-disk Int64 column: raw `[i64]` bytes (no header), page-aligned file length.
+///
+/// Row count is derived as `file_len / 8` at open and validated against `.meta`.
+#[repr(C)]
+pub struct Int64ColumnFile {
+    pub stream: ColumnarFileStream,
+    pub meta: Int64ColumnMeta,
+}
+
+/// One Utf8 index entry: offset+length into the sibling `.blob` (no fixed padding).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Utf8OffsetEntry {
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// Ingest-time `.meta` for a Utf8 column (`.offsets` + `.blob`).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Utf8ColumnMeta {
+    pub row_count: u64,
+    pub blob_len: u64,
+}
+
+/// On-disk Utf8 column: page-aligned `.offsets` (u32 pairs) + raw `.blob` bytes.
+///
+/// The blob has no page-alignment constraint — it is addressed by offset, not chunked.
+pub struct Utf8ColumnFile {
+    offsets_mmap: Mmap,
+    blob_mmap: Mmap,
+    pub meta: Utf8ColumnMeta,
+    total_rows: usize,
+}
+
+impl Utf8ColumnFile {
+    /// Cold-path open of `.offsets` + `.blob` (+ optional `.meta` validation).
+    pub fn open(offsets_path: &Path, blob_path: &Path, meta_path: Option<&Path>) -> io::Result<Self> {
+        let off_file = File::open(offsets_path)?;
+        let blob_file = File::open(blob_path)?;
+        let off_len = off_file.metadata()?.len() as usize;
+        let entry_size = core::mem::size_of::<Utf8OffsetEntry>();
+        if off_len % entry_size != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "utf8 .offsets length not multiple of 8",
+            ));
+        }
+        let capacity_rows = off_len / entry_size;
+        // SAFETY: read-only files; lengths validated.
+        let offsets_mmap = unsafe { Mmap::map(&off_file)? };
+        let blob_mmap = unsafe { Mmap::map(&blob_file)? };
+        let blob_len = blob_mmap.len() as u64;
+        let (meta, total_rows) = if let Some(mp) = meta_path {
+            let m = read_utf8_meta(mp)?;
+            let rc = m.row_count as usize;
+            // Page-alignment padding may extend `.offsets` past logical rows.
+            if rc > capacity_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "utf8 .meta row_count exceeds .offsets capacity",
+                ));
+            }
+            if m.blob_len != blob_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "utf8 .meta blob_len mismatch",
+                ));
+            }
+            (m, rc)
+        } else {
+            (
+                Utf8ColumnMeta {
+                    row_count: capacity_rows as u64,
+                    blob_len,
+                },
+                capacity_rows,
+            )
+        };
+        Ok(Self {
+            offsets_mmap,
+            blob_mmap,
+            meta,
+            total_rows,
+        })
+    }
+
+    #[inline(always)]
+    pub fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    /// Zero-copy UTF-8 view for row `i` (offset+length into `.blob`).
+    #[inline(always)]
+    pub fn get_row(&self, i: usize) -> Option<&str> {
+        if i >= self.total_rows {
+            return None;
+        }
+        let base = i.wrapping_mul(core::mem::size_of::<Utf8OffsetEntry>());
+        if base + 8 > self.offsets_mmap.len() {
+            return None;
+        }
+        let off = u32::from_le_bytes([
+            self.offsets_mmap[base],
+            self.offsets_mmap[base + 1],
+            self.offsets_mmap[base + 2],
+            self.offsets_mmap[base + 3],
+        ]) as usize;
+        let len = u32::from_le_bytes([
+            self.offsets_mmap[base + 4],
+            self.offsets_mmap[base + 5],
+            self.offsets_mmap[base + 6],
+            self.offsets_mmap[base + 7],
+        ]) as usize;
+        let end = off.checked_add(len)?;
+        if end > self.blob_mmap.len() {
+            return None;
+        }
+        core::str::from_utf8(&self.blob_mmap[off..end]).ok()
+    }
+}
+
+fn read_int64_meta(path: &Path) -> io::Result<Int64ColumnMeta> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "int64 .meta too short",
+        ));
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    Ok(Int64ColumnMeta {
+        row_count: u64::from_le_bytes(buf),
+    })
+}
+
+fn write_int64_meta(path: &Path, meta: &Int64ColumnMeta) -> io::Result<()> {
+    let mut f = File::create(path)?;
+    f.write_all(&meta.row_count.to_le_bytes())?;
+    f.flush()?;
+    Ok(())
+}
+
+fn read_utf8_meta(path: &Path) -> io::Result<Utf8ColumnMeta> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "utf8 .meta too short",
+        ));
+    }
+    let mut a = [0u8; 8];
+    let mut b = [0u8; 8];
+    a.copy_from_slice(&bytes[..8]);
+    b.copy_from_slice(&bytes[8..16]);
+    Ok(Utf8ColumnMeta {
+        row_count: u64::from_le_bytes(a),
+        blob_len: u64::from_le_bytes(b),
+    })
+}
+
+fn write_utf8_meta(path: &Path, meta: &Utf8ColumnMeta) -> io::Result<()> {
+    let mut f = File::create(path)?;
+    f.write_all(&meta.row_count.to_le_bytes())?;
+    f.write_all(&meta.blob_len.to_le_bytes())?;
+    f.flush()?;
+    Ok(())
+}
+
+/// Pad `file` so its length is a multiple of `page_size` (ingest cold path).
+fn pad_to_page(file: &mut File, page_size: usize) -> io::Result<()> {
+    let len = file.metadata()?.len() as usize;
+    let rem = len % page_size;
+    if rem == 0 {
+        return Ok(());
+    }
+    let mut left = page_size - rem;
+    let mut chunk = [0u8; 512];
+    while left > 0 {
+        let n = left.min(chunk.len());
+        file.write_all(&chunk[..n])?;
+        left -= n;
+    }
+    Ok(())
+}
+
+/// One memory-mapped page window over a fixed-width Int64 column file.
 ///
 /// `rows` is a direct view into the mmap — **no copy, no heap**.
 #[repr(C)]
@@ -763,7 +991,7 @@ pub struct ColumnarChunk<'a> {
     pub rows: &'a [i64],
     pub row_count: u16,
     pub page_index: u32,
-    /// 1 when `row_count < MAX_ROWS` (EOF residue tail).
+    /// 1 when this is the final partial chunk (`row_count < page_rows`).
     pub is_residue: u8,
     pub _pad: [u8; 1],
 }
@@ -781,100 +1009,149 @@ impl<'a> ColumnarChunk<'a> {
     }
 }
 
-/// Zero-allocation Int64 columnar file stream via OS virtual memory map.
+/// Zero-copy Int64 columnar file stream via OS virtual memory map.
 ///
-/// Cold path: `open` / file create. Hot path: [`ColumnarFileStream::next_page_chunk`]
-/// advances raw pointer offsets by exactly [`MAX_ROWS`] (or the EOF residue).
-#[repr(C)]
+/// # Page derivation
+/// `page_rows = os_page_size_bytes() / row_width` for fixed-width columns
+/// (`row_width == 8` for `i64`). Chunking follows the real OS page size from
+/// `sysconf(_SC_PAGESIZE)`, not a hardcoded row count such as 4096.
+///
+/// Cold path: `open` / ingest. Hot path: [`ColumnarFileStream::next_page_chunk`]
+/// returns a borrowed slice over the mmap (lifetime tied to `&self` / `&mut self`).
 pub struct ColumnarFileStream {
-    /// OS mmap of the entire `.bin` column file (cold-owned mapping object).
-    map: Mmap,
-    /// Total Int64 rows in the file (`map.len() / 8`).
-    total_rows: u64,
-    /// Next row index to yield.
-    cursor_row: u64,
-    /// Pages already yielded.
-    page_index: u32,
-    pub _pad: [u8; 4],
+    /// Owns the OS mapping for this column's lifetime.
+    pub(crate) mmap: Mmap,
+    pub row_width: usize,
+    /// `= sysconf(_SC_PAGESIZE) / row_width`.
+    pub page_rows: usize,
+    pub total_rows: usize,
+    pub cursor_row: usize,
 }
 
 impl ColumnarFileStream {
-    /// Cold-path: open + mmap an Int64 `.bin` column file (little-endian packed).
+    /// Cold-path: open + mmap a raw Int64 `.bin` (optional companion `.meta`).
     pub fn open_i64(path: &Path) -> io::Result<Self> {
+        let meta_path = path.with_extension("meta");
+        let meta = if meta_path.exists() {
+            Some(read_int64_meta(&meta_path)?)
+        } else {
+            None
+        };
+        Self::open_i64_inner(path, meta)
+    }
+
+    /// Cold-path open with explicit `.meta` validation (row_count must match).
+    pub fn open_i64_with_meta(bin_path: &Path, meta_path: &Path) -> io::Result<Self> {
+        let meta = read_int64_meta(meta_path)?;
+        Self::open_i64_inner(bin_path, Some(meta))
+    }
+
+    fn open_i64_inner(path: &Path, meta: Option<Int64ColumnMeta>) -> io::Result<Self> {
         let file = File::open(path)?;
-        let meta = file.metadata()?;
-        let len = meta.len() as usize;
-        if len % core::mem::size_of::<i64>() != 0 {
+        let len = file.metadata()?.len() as usize;
+        let row_width = core::mem::size_of::<i64>();
+        if len % row_width != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "i64 column file length not multiple of 8",
             ));
         }
         // SAFETY: file is opened read-only; length validated.
-        let map = unsafe { Mmap::map(&file)? };
-        let total_rows = (len / core::mem::size_of::<i64>()) as u64;
+        let mmap = unsafe { Mmap::map(&file)? };
+        // Logical row count from payload bytes (ignore page-alignment padding
+        // beyond the last full i64 when a `.meta` row_count is present).
+        let file_rows = len / row_width;
+        let total_rows = if let Some(m) = meta {
+            let rc = m.row_count as usize;
+            if rc > file_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "i64 .meta row_count exceeds file capacity",
+                ));
+            }
+            rc
+        } else {
+            file_rows
+        };
+        let page_size = os_page_size_bytes();
+        let page_rows = if row_width == 0 {
+            1
+        } else {
+            (page_size / row_width).max(1)
+        };
         Ok(Self {
-            map,
+            mmap,
+            row_width,
+            page_rows,
             total_rows,
             cursor_row: 0,
-            page_index: 0,
-            _pad: [0; 4],
         })
+    }
+
+    /// Open an [`Int64ColumnFile`] (stream + validated meta).
+    pub fn open_int64_column(bin_path: &Path, meta_path: &Path) -> io::Result<Int64ColumnFile> {
+        let meta = read_int64_meta(meta_path)?;
+        let stream = Self::open_i64_inner(bin_path, Some(meta))?;
+        Ok(Int64ColumnFile { stream, meta })
     }
 
     #[inline(always)]
     pub fn total_rows(&self) -> u64 {
-        self.total_rows
+        self.total_rows as u64
     }
 
     #[inline(always)]
     pub fn cursor_row(&self) -> u64 {
-        self.cursor_row
+        self.cursor_row as u64
+    }
+
+    #[inline(always)]
+    pub fn page_rows(&self) -> usize {
+        self.page_rows
     }
 
     #[inline(always)]
     pub fn pages_emitted(&self) -> u32 {
-        self.page_index
+        if self.page_rows == 0 {
+            return 0;
+        }
+        (self.cursor_row / self.page_rows) as u32
     }
 
     /// Rewind to the first page (no remapping / no alloc).
     #[inline(always)]
     pub fn rewind(&mut self) {
         self.cursor_row = 0;
-        self.page_index = 0;
     }
 
-    /// Yield the next [`MAX_ROWS`]-capped page as a zero-copy mmap window.
+    /// Advance `cursor_row` by `page_rows` (or the remainder) and return a
+    /// zero-copy borrowed slice view over the mmap.
     ///
-    /// Returns `None` at EOF. Residue pages set `is_residue = 1` and carry
-    /// `1..MAX_ROWS` rows (e.g. 1808 after two full 4096 pages of a 10000-row file).
+    /// Emits a final partial chunk when `total_rows % page_rows != 0`.
     #[inline(always)]
     pub fn next_page_chunk(&mut self) -> Option<ColumnarChunk<'_>> {
         if self.cursor_row >= self.total_rows {
             return None;
         }
-        let remaining = (self.total_rows - self.cursor_row) as usize;
-        let n = if remaining > MAX_ROWS {
-            MAX_ROWS
-        } else {
-            remaining
-        };
-        let byte_off = (self.cursor_row as usize).wrapping_mul(8);
-        let byte_len = n.wrapping_mul(8);
+        let remaining = self.total_rows - self.cursor_row;
+        let n = remaining.min(self.page_rows);
+        let byte_off = self.cursor_row.wrapping_mul(self.row_width);
+        let byte_len = n.wrapping_mul(self.row_width);
         let end = byte_off.wrapping_add(byte_len);
-        if end > self.map.len() {
+        if end > self.mmap.len() {
             return None;
         }
-        let bytes = &self.map[byte_off..end];
-        // SAFETY: length is a multiple of 8; mmap base is page-aligned; i64 view
-        // is valid for `n` elements within the mapped region.
-        let rows: &[i64] = unsafe {
-            core::slice::from_raw_parts(bytes.as_ptr() as *const i64, n)
+        let bytes = &self.mmap[byte_off..end];
+        // SAFETY: length is a multiple of row_width (8); view is within the map.
+        let rows: &[i64] =
+            unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const i64, n) };
+        let page_index = if self.page_rows == 0 {
+            0
+        } else {
+            (self.cursor_row / self.page_rows) as u32
         };
-        let is_residue = (n < MAX_ROWS) as u8;
-        let page_index = self.page_index;
-        self.cursor_row = self.cursor_row.wrapping_add(n as u64);
-        self.page_index = self.page_index.wrapping_add(1);
+        let is_residue = (n < self.page_rows) as u8;
+        self.cursor_row = self.cursor_row.wrapping_add(n);
         Some(ColumnarChunk {
             rows,
             row_count: n as u16,
@@ -888,7 +1165,6 @@ impl ColumnarFileStream {
 /// Multi-column mmap table: independent `.bin` files per physical column.
 ///
 /// Hot path advances all streams in lockstep via [`ColumnarTableStream::next_page`].
-#[repr(C)]
 pub struct ColumnarTableStream {
     pub user_ids: ColumnarFileStream,
     pub ages: ColumnarFileStream,
@@ -920,6 +1196,12 @@ impl ColumnarTableStream {
                 "columnar .bin row counts diverge",
             ));
         }
+        if user_ids.page_rows != ages.page_rows || ages.page_rows != prices.page_rows {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "columnar page_rows diverge",
+            ));
+        }
         Ok(Self {
             user_ids,
             ages,
@@ -929,7 +1211,7 @@ impl ColumnarTableStream {
 
     #[inline(always)]
     pub fn total_rows(&self) -> u64 {
-        self.ages.total_rows
+        self.ages.total_rows as u64
     }
 
     #[inline(always)]
@@ -939,55 +1221,52 @@ impl ColumnarTableStream {
         self.prices.rewind();
     }
 
-    /// Lockstep page advance — all columns share the same row window (disjoint field borrows).
+    /// Lockstep page advance — all columns share the same OS-page row window.
     #[inline(always)]
     pub fn next_page(&mut self) -> Option<ColumnarTablePage<'_>> {
         if self.ages.cursor_row >= self.ages.total_rows {
             return None;
         }
-        let start_row = self.ages.cursor_row as usize;
-        let remaining = (self.ages.total_rows as usize).saturating_sub(start_row);
-        let n = if remaining > MAX_ROWS {
-            MAX_ROWS
-        } else {
-            remaining
-        };
+        let start_row = self.ages.cursor_row;
+        let page_rows = self.ages.page_rows;
+        let remaining = self.ages.total_rows.saturating_sub(start_row);
+        let n = remaining.min(page_rows);
         let byte_off = start_row.wrapping_mul(8);
         let byte_end = byte_off.wrapping_add(n.wrapping_mul(8));
-        if byte_end > self.ages.map.len()
-            || byte_end > self.user_ids.map.len()
-            || byte_end > self.prices.map.len()
+        if byte_end > self.ages.mmap.len()
+            || byte_end > self.user_ids.mmap.len()
+            || byte_end > self.prices.mmap.len()
         {
             return None;
         }
         let ages = unsafe {
             core::slice::from_raw_parts(
-                self.ages.map[byte_off..byte_end].as_ptr() as *const i64,
+                self.ages.mmap[byte_off..byte_end].as_ptr() as *const i64,
                 n,
             )
         };
         let user_ids = unsafe {
             core::slice::from_raw_parts(
-                self.user_ids.map[byte_off..byte_end].as_ptr() as *const i64,
+                self.user_ids.mmap[byte_off..byte_end].as_ptr() as *const i64,
                 n,
             )
         };
         let prices = unsafe {
             core::slice::from_raw_parts(
-                self.prices.map[byte_off..byte_end].as_ptr() as *const i64,
+                self.prices.mmap[byte_off..byte_end].as_ptr() as *const i64,
                 n,
             )
         };
-        let page_index = self.ages.page_index;
-        let is_residue = (n < MAX_ROWS) as u8;
-        let next_cursor = self.ages.cursor_row.wrapping_add(n as u64);
-        let next_page = self.ages.page_index.wrapping_add(1);
+        let page_index = if page_rows == 0 {
+            0
+        } else {
+            (start_row / page_rows) as u32
+        };
+        let is_residue = (n < page_rows) as u8;
+        let next_cursor = start_row.wrapping_add(n);
         self.ages.cursor_row = next_cursor;
         self.user_ids.cursor_row = next_cursor;
         self.prices.cursor_row = next_cursor;
-        self.ages.page_index = next_page;
-        self.user_ids.page_index = next_page;
-        self.prices.page_index = next_page;
         Some(ColumnarTablePage {
             user_ids,
             ages,
@@ -1000,9 +1279,11 @@ impl ColumnarTableStream {
     }
 }
 
-/// Cold-path: write a packed little-endian Int64 `.bin` column file.
+/// Cold-path: write a packed little-endian Int64 `.bin` + companion `.meta`.
 ///
-/// Writes in [`MAX_ROWS`] stack windows — never materializes the full column as `Vec`.
+/// File payload is padded to the OS page size. Writes in stack windows of
+/// [`MAX_ROWS`] — never materializes the full column as `Vec` of values
+/// (padding uses a small page-sized buffer only at EOF).
 pub fn write_i64_column_bin<F>(path: &Path, total_rows: usize, mut fill: F) -> io::Result<()>
 where
     F: FnMut(usize) -> i64,
@@ -1026,13 +1307,58 @@ where
         file.write_all(bytes)?;
         written += n;
     }
+    let page_size = os_page_size_bytes();
+    pad_to_page(&mut file, page_size)?;
     file.flush()?;
+    let meta_path = path.with_extension("meta");
+    write_int64_meta(
+        &meta_path,
+        &Int64ColumnMeta {
+            row_count: total_rows as u64,
+        },
+    )?;
+    Ok(())
+}
+
+/// Cold-path: write Utf8 `.offsets` (page-aligned) + `.blob` + `.meta`.
+pub fn write_utf8_column_files(
+    offsets_path: &Path,
+    blob_path: &Path,
+    meta_path: &Path,
+    rows: &[&[u8]],
+) -> io::Result<()> {
+    let mut off_file = File::create(offsets_path)?;
+    let mut blob_file = File::create(blob_path)?;
+    let mut blob_len = 0u32;
+    let mut i = 0usize;
+    while i < rows.len() {
+        let s = rows[i];
+        let entry = Utf8OffsetEntry {
+            offset: blob_len,
+            length: s.len() as u32,
+        };
+        off_file.write_all(&entry.offset.to_le_bytes())?;
+        off_file.write_all(&entry.length.to_le_bytes())?;
+        blob_file.write_all(s)?;
+        blob_len = blob_len.wrapping_add(s.len() as u32);
+        i += 1;
+    }
+    pad_to_page(&mut off_file, os_page_size_bytes())?;
+    off_file.flush()?;
+    blob_file.flush()?;
+    write_utf8_meta(
+        meta_path,
+        &Utf8ColumnMeta {
+            row_count: rows.len() as u64,
+            blob_len: blob_len as u64,
+        },
+    )?;
     Ok(())
 }
 
 /// Cold-path: materialize Stage-4 demo columnar files under `dir`.
 ///
-/// Layout: `user_ids.bin`, `ages.bin`, `prices.bin` — `total_rows` Int64 records each.
+/// Layout: `user_ids.bin`, `ages.bin`, `prices.bin` (+ `.meta`) — `total_rows` each.
 pub fn write_stage4_columnar_demo(dir: &Path, total_rows: usize) -> io::Result<()> {
     write_i64_column_bin(&dir.join("user_ids.bin"), total_rows, |i| (i % 16) as i64)?;
     write_i64_column_bin(&dir.join("ages.bin"), total_rows, |i| (18 + (i % 40)) as i64)?;
@@ -1058,26 +1384,78 @@ mod tests {
     }
 
     #[test]
-    fn columnar_file_stream_pages_10000() {
-        let dir = std::env::temp_dir().join("tamil_mmap_unit");
+    fn test_mmap_page_streaming_10000_rows_exact_remainder() {
+        const TOTAL: usize = 10_000;
+        let dir = std::env::temp_dir().join("tamil_mmap_page_stream_v2");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("ages.bin");
-        write_i64_column_bin(&path, 10_000, |i| i as i64).unwrap();
+        write_i64_column_bin(&path, TOTAL, |i| i as i64).unwrap();
         let mut stream = ColumnarFileStream::open_i64(&path).unwrap();
-        assert_eq!(stream.total_rows(), 10_000);
-        let p0 = stream.next_page_chunk().unwrap();
-        assert_eq!(p0.row_count as usize, MAX_ROWS);
-        assert_eq!(p0.is_residue, 0);
-        assert_eq!(p0.rows[0], 0);
-        assert_eq!(p0.rows[4095], 4095);
-        let p1 = stream.next_page_chunk().unwrap();
-        assert_eq!(p1.row_count as usize, MAX_ROWS);
-        assert_eq!(p1.rows[0], 4096);
-        let p2 = stream.next_page_chunk().unwrap();
-        assert_eq!(p2.row_count as usize, 1808);
-        assert_eq!(p2.is_residue, 1);
-        assert_eq!(p2.rows[0], 8192);
-        assert_eq!(p2.rows[1807], 9999);
-        assert!(stream.next_page_chunk().is_none());
+        let page_rows = stream.page_rows();
+        assert_eq!(page_rows, os_page_size_bytes() / 8);
+        assert_eq!(stream.total_rows(), TOTAL as u64);
+        let expected_full = TOTAL / page_rows;
+        let expected_rem = TOTAL % page_rows;
+        let mut sum = 0usize;
+        let mut full = 0usize;
+        let mut last_n = 0usize;
+        let mut last_residue = 0u8;
+        while let Some(chunk) = stream.next_page_chunk() {
+            sum += chunk.row_count as usize;
+            if chunk.is_residue == 0 {
+                assert_eq!(chunk.row_count as usize, page_rows);
+                full += 1;
+            } else {
+                last_n = chunk.row_count as usize;
+                last_residue = 1;
+            }
+        }
+        assert_eq!(sum, TOTAL);
+        assert_eq!(full, expected_full);
+        if expected_rem == 0 {
+            assert_eq!(last_residue, 0);
+        } else {
+            assert_eq!(last_residue, 1);
+            assert_eq!(last_n, expected_rem);
+        }
+    }
+
+    #[test]
+    fn columnar_file_stream_pages_10000() {
+        // Compatibility wrapper: same geometry as the named Stage-4 v2 test.
+        const TOTAL: usize = 10_000;
+        let dir = std::env::temp_dir().join("tamil_mmap_unit_v2");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ages.bin");
+        write_i64_column_bin(&path, TOTAL, |i| i as i64).unwrap();
+        let mut stream = ColumnarFileStream::open_i64(&path).unwrap();
+        let page_rows = stream.page_rows();
+        let rem = TOTAL % page_rows;
+        let mut sum = 0usize;
+        while let Some(p) = stream.next_page_chunk() {
+            sum += p.row_count as usize;
+            if p.is_residue != 0 {
+                assert_eq!(p.row_count as usize, rem);
+            } else {
+                assert_eq!(p.row_count as usize, page_rows);
+            }
+        }
+        assert_eq!(sum, TOTAL);
+    }
+
+    #[test]
+    fn utf8_column_file_offset_blob_roundtrip() {
+        let dir = std::env::temp_dir().join("tamil_utf8_col_v2");
+        let _ = std::fs::create_dir_all(&dir);
+        let offsets = dir.join("names.offsets");
+        let blob = dir.join("names.blob");
+        let meta = dir.join("names.meta");
+        let rows: [&[u8]; 3] = ["அருண்".as_bytes(), "பிரியா".as_bytes(), "கண்ணன்".as_bytes()];
+        write_utf8_column_files(&offsets, &blob, &meta, &rows).unwrap();
+        let f = Utf8ColumnFile::open(&offsets, &blob, Some(&meta)).unwrap();
+        assert_eq!(f.total_rows(), 3);
+        assert_eq!(f.get_row(0), Some("அருண்"));
+        assert_eq!(f.get_row(1), Some("பிரியா"));
+        assert_eq!(f.get_row(2), Some("கண்ணன்"));
     }
 }

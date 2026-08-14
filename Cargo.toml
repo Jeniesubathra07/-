@@ -33,4 +33,8 @@ inherits = "release"
 [dev-dependencies]
 
 [dependencies]
+# Sole dependency: OS page mapping for Stage-4 columnar persistence.
+# Does not violate the "no std::alloc in hot path" invariant — mmap maps pages
+# via the OS virtual-memory subsystem, not the Rust allocator. Accessing mapped
+# memory is a load from an OS mapping, not a Vec/Box/String allocation.
 memmap2 = "0.9"

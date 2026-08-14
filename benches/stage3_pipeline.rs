@@ -51,7 +51,7 @@ fn main() {
             &mut scratch,
             &mut tokens,
         );
-        core::hint::black_box(ok);
+        core::hint::black_box(ok.is_ok());
         core::hint::black_box(out.row_count);
     });
 
@@ -64,7 +64,7 @@ fn main() {
             &mut scratch,
             &mut tokens,
         );
-        core::hint::black_box(ok);
+        core::hint::black_box(ok.is_ok());
         core::hint::black_box(out.row_count);
     });
 

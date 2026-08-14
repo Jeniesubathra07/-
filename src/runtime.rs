@@ -12,11 +12,77 @@ use crate::lexer::TokenKind;
 use crate::parser::{AstArena, AstNode, NodeKind, NIL};
 use crate::storage::{
     seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColName, ColumnMeta,
-    Int64Column, PhysType, SelectionVector, Table, Utf8Column, BATCH_ROWS, MAX_ROWS,
+    ColumnarFileStream, Int64Column, PhysType, SelectionVector, Table, Utf8Column, BATCH_ROWS,
+    MAX_ROWS, NAME_CAP,
 };
 
 /// Maximum projected output columns.
 pub const MAX_PROJECT: usize = 8;
+
+/// Diagnosable engine failure (replaces the opaque `bool` from earlier stages).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineError {
+    ParseFailed,
+    ColumnNotFound {
+        table: [u8; NAME_CAP],
+        column: [u8; NAME_CAP],
+    },
+    IoError,
+    PageCorrupt {
+        page_index: u32,
+    },
+}
+
+impl EngineError {
+    #[inline(always)]
+    pub fn column_not_found(table: &[u8], column: &[u8]) -> Self {
+        Self::ColumnNotFound {
+            table: name_to_cap(table),
+            column: name_to_cap(column),
+        }
+    }
+}
+
+impl core::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EngineError::ParseFailed => write!(f, "ParseFailed"),
+            EngineError::ColumnNotFound { table, column } => {
+                let t = core::str::from_utf8(trim_name(table)).unwrap_or("?");
+                let c = core::str::from_utf8(trim_name(column)).unwrap_or("?");
+                write!(f, "ColumnNotFound {{ table: {t}, column: {c} }}")
+            }
+            EngineError::IoError => write!(f, "IoError"),
+            EngineError::PageCorrupt { page_index } => {
+                write!(f, "PageCorrupt {{ page_index: {page_index} }}")
+            }
+        }
+    }
+}
+
+impl From<std::io::Error> for EngineError {
+    fn from(_: std::io::Error) -> Self {
+        EngineError::IoError
+    }
+}
+
+#[inline(always)]
+fn name_to_cap(src: &[u8]) -> [u8; NAME_CAP] {
+    let mut out = [0u8; NAME_CAP];
+    let n = src.len().min(NAME_CAP);
+    out[..n].copy_from_slice(&src[..n]);
+    out
+}
+
+#[inline(always)]
+fn trim_name(buf: &[u8; NAME_CAP]) -> &[u8] {
+    let mut n = 0usize;
+    while n < NAME_CAP && buf[n] != 0 {
+        n += 1;
+    }
+    &buf[..n]
+}
+
 
 /// Width of the inner unrolled compare lane group.
 pub const UNROLL: usize = 8;
@@ -836,19 +902,24 @@ impl<'a> Engine<'a> {
         bin: &AstNode,
         arena: &AstArena,
         sel: &mut SelectionVector,
-    ) -> bool {
+    ) -> Result<(), EngineError> {
         let left = match arena.get(bin.left) {
             Some(n) => n,
-            None => return false,
+            None => return Err(EngineError::ParseFailed),
         };
         let right = match arena.get(bin.right) {
             Some(n) => n,
-            None => return false,
+            None => return Err(EngineError::ParseFailed),
         };
         let col_name = self.ident_bytes(left);
         let col = match table.find_column(col_name) {
             Some(c) => c,
-            None => return false,
+            None => {
+                return Err(EngineError::column_not_found(
+                    table.name.as_bytes(),
+                    col_name,
+                ))
+            }
         };
         let lit = right.value;
         let rows = table.row_count as usize;
@@ -856,19 +927,22 @@ impl<'a> Engine<'a> {
             Some(col_data) => match bin.op {
                 TokenKind::Gt => {
                     Self::filter_i64_gt(&col_data.values, sel, rows, lit);
-                    true
+                    Ok(())
                 }
                 TokenKind::Lt => {
                     Self::filter_i64_lt(&col_data.values, sel, rows, lit);
-                    true
+                    Ok(())
                 }
                 TokenKind::Eq => {
                     Self::filter_i64_eq(&col_data.values, sel, rows, lit);
-                    true
+                    Ok(())
                 }
-                _ => false,
+                _ => Err(EngineError::ParseFailed),
             },
-            None => false,
+            None => Err(EngineError::column_not_found(
+                table.name.as_bytes(),
+                col_name,
+            )),
         }
     }
 
@@ -882,7 +956,7 @@ impl<'a> Engine<'a> {
         arena: &AstArena,
         order_len: usize,
         out: &mut QueryResult,
-    ) -> bool {
+    ) -> Result<(), EngineError> {
         let join_left = &scratch.join_left;
         let join_right = &scratch.join_right;
         let order = &scratch.order;
@@ -925,10 +999,13 @@ impl<'a> Engine<'a> {
                     out.live[nproj] = 1;
                     nproj += 1;
                 } else {
-                    return false;
+                    return Err(EngineError::column_not_found(
+                        left.name.as_bytes(),
+                        name,
+                    ));
                 }
             } else {
-                return false;
+                return Err(EngineError::column_not_found(left.name.as_bytes(), name));
             }
             cur = node.next;
         }
@@ -965,7 +1042,7 @@ impl<'a> Engine<'a> {
                 } else if let Some(rt) = right {
                     rt
                 } else {
-                    return false;
+                    return Err(EngineError::ParseFailed);
                 };
                 match out.types[c] {
                     PhysType::Int64 => {
@@ -989,7 +1066,7 @@ impl<'a> Engine<'a> {
             oi += 1;
         }
         out.row_count = out_row as u16;
-        true
+        Ok(())
     }
 
     /// Execute a parsed pipeline.
@@ -1001,10 +1078,10 @@ impl<'a> Engine<'a> {
         arena: &AstArena,
         out: &mut QueryResult,
         scratch: &mut RuntimeScratch,
-    ) -> bool {
+    ) -> Result<(), EngineError> {
         let root = match arena.get(arena.root) {
             Some(n) if n.kind == NodeKind::Pipeline => n,
-            _ => return false,
+            _ => return Err(EngineError::ParseFailed),
         };
 
         let mut stage_id = root.left;
@@ -1020,18 +1097,20 @@ impl<'a> Engine<'a> {
         while stage_id != NIL {
             let stage = match arena.get(stage_id) {
                 Some(s) => s,
-                None => return false,
+                None => return Err(EngineError::ParseFailed),
             };
             match stage.kind {
                 NodeKind::From => {
                     let ident = match arena.get(stage.left) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let table_name = self.ident_bytes(ident);
                     let table = match self.catalog.find(table_name) {
                         Some(t) => t,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(table_name, b""))
+                        }
                     };
                     active_rows = (table.row_count as usize).min(MAX_ROWS);
                     sel = SelectionVector::all(active_rows);
@@ -1052,32 +1131,44 @@ impl<'a> Engine<'a> {
                 NodeKind::Join => {
                     let left = match table_ref {
                         Some(t) => t,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let rel = match arena.get(stage.left) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let right_name = self.ident_bytes(rel);
                     let right = match self.catalog.find(right_name) {
                         Some(t) => t,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(right_name, b""))
+                        }
                     };
                     let left_key_col = match left.find_column("அடையாளம்".as_bytes()) {
                         Some(c) => c,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(
+                                left.name.as_bytes(),
+                                "அடையாளம்".as_bytes(),
+                            ))
+                        }
                     };
                     let right_key_col = match right.find_column("அடையாளம்".as_bytes()) {
                         Some(c) => c,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(
+                                right.name.as_bytes(),
+                                "அடையாளம்".as_bytes(),
+                            ))
+                        }
                     };
                     let left_keys = match left.int64(left_key_col) {
                         Some(c) => &c.values,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let right_keys = match right.int64(right_key_col) {
                         Some(c) => &c.values,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     // Restrict left side to currently selected rows (dense).
                     let mut ln = 0usize;
@@ -1132,19 +1223,19 @@ impl<'a> Engine<'a> {
                 NodeKind::Filter => {
                     let table = match table_ref {
                         Some(t) => t,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let bin = match arena.get(stage.left) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let left_ast = match arena.get(bin.left) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let right_ast = match arena.get(bin.right) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let col_name = self.ident_bytes(left_ast);
                     let lit = right_ast.value;
@@ -1215,7 +1306,10 @@ impl<'a> Engine<'a> {
                             }
                         }
                         if !values_buf_ok {
-                            return false;
+                            return Err(EngineError::column_not_found(
+                                table.name.as_bytes(),
+                                col_name,
+                            ));
                         }
                         order_len = 0;
                         let mut i = 0usize;
@@ -1225,9 +1319,7 @@ impl<'a> Engine<'a> {
                             i += 1;
                         }
                     } else {
-                        if !self.apply_filter(table, bin, arena, &mut sel) {
-                            return false;
-                        }
+                        self.apply_filter(table, bin, arena, &mut sel)?;
                         if !sorted {
                             order_len = 0;
                             let mut i = 0usize;
@@ -1253,16 +1345,21 @@ impl<'a> Engine<'a> {
                 NodeKind::Sort => {
                     let table = match table_ref {
                         Some(t) => t,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let col_node = match arena.get(stage.left) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let col_name = self.ident_bytes(col_node);
                     let col = match table.find_column(col_name) {
                         Some(c) => c,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(
+                                table.name.as_bytes(),
+                                col_name,
+                            ))
+                        }
                     };
                     match table.int64(col) {
                         Some(col_data) => {
@@ -1303,7 +1400,7 @@ impl<'a> Engine<'a> {
                                 sorted = true;
                             }
                         }
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     }
                 }
                 NodeKind::Take => {
@@ -1312,9 +1409,9 @@ impl<'a> Engine<'a> {
                 NodeKind::Project => {
                     let table = match table_ref {
                         Some(t) => t,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
-                    if !self.materialize_projection(
+                    self.materialize_projection(
                         table,
                         right_ref,
                         joined,
@@ -1323,9 +1420,7 @@ impl<'a> Engine<'a> {
                         arena,
                         order_len,
                         out,
-                    ) {
-                        return false;
-                    }
+                    )?;
                 }
                 NodeKind::Derive => {
                     if !self.apply_derive(
@@ -1338,11 +1433,11 @@ impl<'a> Engine<'a> {
                         active_rows,
                         scratch,
                     ) {
-                        return false;
+                        return Err(EngineError::ParseFailed);
                     }
                 }
                 NodeKind::Group | NodeKind::Aggregate => {}
-                _ => return false,
+                _ => return Err(EngineError::ParseFailed),
             }
             stage_id = stage.next;
         }
@@ -1368,7 +1463,7 @@ impl<'a> Engine<'a> {
             }
             out.row_count = r as u16;
         }
-        true
+        Ok(())
     }
 
     /// Resolve an Ident / Literal operand into a dense `[i64; n]` key buffer.
@@ -1610,16 +1705,88 @@ pub fn run_query(
     out: &mut QueryResult,
     scratch: &mut RuntimeScratch,
     tokens: &mut [crate::lexer::Token; crate::lexer::MAX_TOKENS],
-) -> bool {
+) -> Result<(), EngineError> {
     arena.len = 0;
     arena.root = NIL;
+    out.col_count = 0;
+    out.row_count = 0;
     let root = match crate::parser::parse_query(src.as_bytes(), arena, tokens) {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => return Err(EngineError::ParseFailed),
     };
     debug_assert_eq!(arena.root, root);
     let engine = Engine::new(catalog, src.as_bytes());
     engine.execute(arena, out, scratch)
+}
+
+impl<'a> Engine<'a> {
+    /// Stream an Int64 mmap column through vectorized filter kernels page-by-page.
+    ///
+    /// Reuses `out`'s buffers across chunks: `row_count` accumulates and is never
+    /// reset between pages (capped at [`MAX_ROWS`]). Hot path: zero Rust allocator
+    /// traffic — only OS-mapped page views from [`ColumnarFileStream`].
+    pub fn execute_streaming(
+        &self,
+        _arena: &AstArena,
+        stream: &mut ColumnarFileStream,
+        out: &mut QueryResult,
+    ) -> Result<(), EngineError> {
+        // Seed a single Int64 output column; accumulate kept rows across pages.
+        out.schema[0] = ColumnMeta {
+            name: ColName::from_bytes(b"stream"),
+            phys: PhysType::Int64,
+            _pad: [0; 3],
+            data_off: 0,
+            offsets_off: 0,
+        };
+        out.types[0] = PhysType::Int64;
+        out.live[0] = 1;
+        out.col_count = 1;
+        // Do not reset row_count here if caller already accumulated; for a fresh
+        // stream start callers typically zero it. We only append.
+        let mut acc = out.row_count as usize;
+
+        let mut page_err: Option<EngineError> = None;
+        ENGINE_SCRATCH_PAD.with(|cell| {
+            let pad = unsafe { &mut *cell.get() };
+            let values = &mut pad.dense;
+            loop {
+                let page = match stream.next_page_chunk() {
+                    Some(p) => p,
+                    None => break,
+                };
+                let n = page.row_count as usize;
+                if n == 0 || page.rows.len() != n {
+                    page_err = Some(EngineError::PageCorrupt {
+                        page_index: page.page_index,
+                    });
+                    break;
+                }
+                let copy_n = n.min(MAX_ROWS);
+                let mut i = 0usize;
+                while i < copy_n {
+                    values[i] = page.rows[i];
+                    i += 1;
+                }
+                let mut sel = SelectionVector::all(copy_n);
+                filter_i64_chunked(values, &mut sel, copy_n, 21, CmpOp::Gt);
+                let mut r = 0usize;
+                while r < copy_n && acc < MAX_ROWS {
+                    if sel.mask[r] != 0 {
+                        out.int_out[0].values[acc] = values[r];
+                        out.int_out[0].validity.set(acc, true);
+                        acc += 1;
+                    }
+                    r += 1;
+                }
+            }
+        });
+        if let Some(e) = page_err {
+            return Err(e);
+        }
+        out.row_count = acc as u16;
+        Ok(())
+    }
 }
 
 /// Stage-4 mmap stream statistics (flat POD — no heap).
@@ -1772,7 +1939,7 @@ mod tests {
         let mut out = QueryResult::new_boxed();
         let mut scratch = RuntimeScratch::new_boxed();
         let mut tokens = crate::parser::alloc_token_window();
-        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         assert_eq!(out.col_count, 2);
         assert_eq!(out.row_count, 10);
         let mut prev = i64::MIN;

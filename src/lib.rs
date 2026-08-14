@@ -23,13 +23,15 @@ pub use runtime::{
     demo_catalog, execute_chunk_parallel, execute_chunk_parallel_os,
     execute_mmap_age_filter_stream, execute_mmap_table_filter_project_stream, lsd_radix_sort_ages,
     lsd_radix_sort_ages_tls, run_query, vector_merge_join, ArithOp, ChunkScratch, Engine,
-    EngineScratchPad, MmapStreamStats, QueryResult, RadixScratchPad, RuntimeScratch,
+    EngineError, EngineScratchPad, MmapStreamStats, QueryResult, RadixScratchPad, RuntimeScratch,
 };
 pub use storage::{
-    seed_orders_database, seed_orders_table, seed_users_table, write_i64_column_bin,
-    write_stage4_columnar_demo, Catalog, ColName, ColumnData, ColumnarChunk, ColumnarFileStream,
-    ColumnarTablePage, ColumnarTableStream, FixedOrdersDatabase, Int64Column, PhysType,
-    SelectionVector, Table, Utf8Column, BATCH_ROWS, MAX_ROWS,
+    os_page_size_bytes, seed_orders_database, seed_orders_table, seed_users_table,
+    write_i64_column_bin, write_stage4_columnar_demo, write_utf8_column_files, Catalog, ColName,
+    ColumnData, ColumnarChunk, ColumnarFileStream, ColumnarTablePage, ColumnarTableStream,
+    FixedOrdersDatabase, Int64Column, Int64ColumnFile, Int64ColumnMeta, PhysType, SelectionVector,
+    Table, Utf8Column, Utf8ColumnFile, Utf8ColumnMeta, Utf8OffsetEntry, BATCH_ROWS, MAX_ROWS,
+    NAME_CAP,
 };
 pub use parser::{
     alloc_token_window, parse_query, AstArena, AstNode, NodeKind, OpKind, ParseError, Parser, ParserError, AST_CAP, NIL,
@@ -120,7 +122,7 @@ mod e2e_tests {
 
         reset_counters();
         set_tracking(true);
-        let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens);
+        let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok();
         set_tracking(false);
 
         assert!(ok, "pipeline must execute successfully");
@@ -389,7 +391,7 @@ mod e2e_tests {
         let mut out = QueryResult::new_boxed();
         let mut scratch = RuntimeScratch::new_boxed();
         let mut tokens = alloc_token_window();
-        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         assert_eq!(out.row_count, 1);
         assert_eq!(out.int_out[0].values[0], 1024);
     }
@@ -435,7 +437,7 @@ mod e2e_tests {
         let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens);
+        let ok = run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok();
         set_tracking(false);
         assert!(ok);
         assert_eq!(alloc_count(), 0);
@@ -453,7 +455,7 @@ mod e2e_tests {
         let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        assert!(run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(DEMO_QUERY, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         set_tracking(false);
         assert_eq!(alloc_count(), 0);
         assert_eq!(out.row_count, 10);
@@ -521,7 +523,7 @@ mod e2e_tests {
         let mut out2 = QueryResult::new_boxed();
         let mut scratch2 = RuntimeScratch::new_boxed();
         let mut tokens2 = alloc_token_window();
-        assert!(run_query(q, &cat, &mut arena2, &mut out2, &mut scratch2, &mut tokens2));
+        assert!(run_query(q, &cat, &mut arena2, &mut out2, &mut scratch2, &mut tokens2).is_ok());
         assert_eq!(out2.row_count, 2);
         assert_eq!(out2.int_out[0].values[0], 2048);
         assert_eq!(out2.int_out[0].values[1], 2049);
@@ -604,7 +606,7 @@ mod e2e_tests {
         let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        assert!(run_query(DEMO_QUERY, &demo_cat, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(DEMO_QUERY, &demo_cat, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         set_tracking(false);
         assert_eq!(alloc_count(), 0);
         assert_eq!(out.row_count, 10);
@@ -614,7 +616,7 @@ mod e2e_tests {
         let mut scratch2 = RuntimeScratch::new_boxed();
         let mut tokens2 = alloc_token_window();
         let q = "இருந்து பயனர்கள் | வடி வயது > 2047 | அடுக்கு வயது | எடு 10 | தேடு வயது;";
-        assert!(run_query(q, &cat, &mut arena2, &mut out2, &mut scratch2, &mut tokens2));
+        assert!(run_query(q, &cat, &mut arena2, &mut out2, &mut scratch2, &mut tokens2).is_ok());
         assert_eq!(out2.row_count, 2);
         assert_eq!(out2.int_out[0].values[0], 2048);
         assert_eq!(out2.int_out[0].values[1], 2049);
@@ -654,7 +656,7 @@ mod e2e_tests {
         let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         set_tracking(false);
         assert_eq!(alloc_count(), 0, "join hot path must not allocate");
         assert_eq!(out.col_count, 2);
@@ -711,7 +713,7 @@ mod e2e_tests {
         let mut scratch = RuntimeScratch::new_boxed();
         let mut tokens = alloc_token_window();
         assert!(
-            run_query(&q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens),
+            run_query(&q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok(),
             "deep chain must parse+execute without stack overflow"
         );
         assert_eq!(out.row_count, 5);
@@ -828,7 +830,7 @@ mod e2e_tests {
         let mut out = QueryResult::new_boxed();
         let mut scratch = RuntimeScratch::new_boxed();
         let mut tokens = alloc_token_window();
-        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         assert_eq!(out.row_count, 4);
     }
 
@@ -890,7 +892,7 @@ mod e2e_tests {
         let mut out = QueryResult::new_boxed();
         let mut sc2 = RuntimeScratch::new_boxed();
         let mut tokens2 = alloc_token_window();
-        assert!(run_query(q, &cat, &mut arena, &mut out, &mut sc2, &mut tokens2));
+        assert!(run_query(q, &cat, &mut arena, &mut out, &mut sc2, &mut tokens2).is_ok());
         assert_eq!(out.row_count, 2);
         assert_eq!(out.int_out[0].values[0], 2048);
         assert_eq!(out.int_out[0].values[1], 2049);
@@ -950,7 +952,7 @@ mod e2e_tests {
         let mut out = QueryResult::new_boxed();
         let mut scratch = RuntimeScratch::new_boxed();
         let mut tokens = alloc_token_window();
-        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         assert_eq!(out.row_count, 11);
     }
 
@@ -1039,7 +1041,7 @@ mod e2e_tests {
         let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         set_tracking(false);
         assert_eq!(alloc_count(), 0, "GATE1 heap must stay 0");
         assert_eq!(out.row_count, 11);
@@ -1492,7 +1494,7 @@ mod e2e_tests {
         let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         set_tracking(false);
         assert_eq!(alloc_count(), 0);
         assert_eq!(out.row_count, 11);
@@ -1529,7 +1531,7 @@ mod e2e_tests {
         let mut tokens = alloc_token_window();
         reset_counters();
         set_tracking(true);
-        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens));
+        assert!(run_query(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         set_tracking(false);
         assert_eq!(alloc_count(), 0, "derive hot path must not allocate");
         assert_eq!(scratch.has_derived, 1);
@@ -1563,41 +1565,46 @@ mod e2e_tests {
         assert!(found, "derived slab must hold computed *mut i64 values");
     }
 
-    /// STAGE-4: mmap columnar page stream over 10_000 rows (2×4096 + 1808 residue).
+    /// STAGE-4 v2: mmap page stream over 10_000 rows using OS page-size chunking.
     #[test]
     fn test_persistent_mmap_page_streaming_fidelity() {
         const TOTAL: usize = 10_000;
-        assert_eq!(TOTAL / MAX_ROWS, 2);
-        assert_eq!(TOTAL % MAX_ROWS, 1808);
+        let page_rows = os_page_size_bytes() / 8;
+        let expected_full = (TOTAL / page_rows) as u32;
+        let expected_rem = (TOTAL % page_rows) as u32;
 
-        let dir = std::env::temp_dir().join("tamil_stage4_mmap_fidelity");
+        let dir = std::env::temp_dir().join("tamil_stage4_mmap_fidelity_v2");
         let _ = std::fs::create_dir_all(&dir);
         write_stage4_columnar_demo(&dir, TOTAL).expect("write columnar bins");
 
-        // --- A: single-column ages stream page geometry ---
         let ages_path = dir.join("ages.bin");
         let mut ages = ColumnarFileStream::open_i64(&ages_path).expect("mmap ages");
         assert_eq!(ages.total_rows(), TOTAL as u64);
+        assert_eq!(ages.page_rows(), page_rows);
 
-        let p0 = ages.next_page_chunk().expect("page0");
-        assert_eq!(p0.page_index, 0);
-        assert_eq!(p0.row_count as usize, MAX_ROWS);
-        assert_eq!(p0.is_residue, 0);
-        assert_eq!(p0.rows.len(), MAX_ROWS);
+        let mut sum = 0usize;
+        let mut full = 0u32;
+        let mut residue = 0u32;
+        let mut last_rem = 0u32;
+        while let Some(p) = ages.next_page_chunk() {
+            sum += p.row_count as usize;
+            if p.is_residue == 0 {
+                assert_eq!(p.row_count as usize, page_rows);
+                full += 1;
+            } else {
+                residue += 1;
+                last_rem = p.row_count as u32;
+            }
+        }
+        assert_eq!(sum, TOTAL);
+        assert_eq!(full, expected_full);
+        if expected_rem == 0 {
+            assert_eq!(residue, 0);
+        } else {
+            assert_eq!(residue, 1);
+            assert_eq!(last_rem, expected_rem);
+        }
 
-        let p1 = ages.next_page_chunk().expect("page1");
-        assert_eq!(p1.page_index, 1);
-        assert_eq!(p1.row_count as usize, MAX_ROWS);
-        assert_eq!(p1.is_residue, 0);
-
-        let p2 = ages.next_page_chunk().expect("residue");
-        assert_eq!(p2.page_index, 2);
-        assert_eq!(p2.row_count as usize, 1808);
-        assert_eq!(p2.is_residue, 1);
-        assert_eq!(p2.rows.len(), 1808);
-        assert!(ages.next_page_chunk().is_none());
-
-        // --- B: stream filter+derive via TLS pads — zero hot-path heap ---
         let mut ages2 = ColumnarFileStream::open_i64(&ages_path).expect("mmap ages2");
         let mut scratch = RuntimeScratch::new_boxed();
         let mut stats = MmapStreamStats::default();
@@ -1608,21 +1615,20 @@ mod e2e_tests {
         let elapsed = t0.elapsed();
         set_tracking(false);
         assert_eq!(alloc_count(), 0, "mmap page loop must not allocate");
-        assert_eq!(stats.pages_full, 2);
-        assert_eq!(stats.pages_residue, 1);
-        assert_eq!(stats.residue_rows, 1808);
+        assert_eq!(stats.pages_full, expected_full);
+        assert_eq!(stats.pages_residue, if expected_rem == 0 { 0 } else { 1 });
+        if expected_rem != 0 {
+            assert_eq!(stats.residue_rows, expected_rem);
+        }
         assert_eq!(stats.rows_scanned, TOTAL as u64);
-        // ages = 18 + (i % 40); kept when > 21.
         assert!(stats.rows_kept > 0);
         assert!(stats.rows_kept < stats.rows_scanned);
-        // Sub-microsecond per-row budget envelope (coarse wall check on page router).
         let ns_per_row = elapsed.as_nanos() / (TOTAL as u128);
         assert!(
             ns_per_row < 5_000,
             "per-row mmap path too slow: {ns_per_row} ns"
         );
 
-        // --- C: multi-column lockstep table stream ---
         let mut table = ColumnarTableStream::open(
             &dir.join("user_ids.bin"),
             &dir.join("ages.bin"),
@@ -1646,9 +1652,8 @@ mod e2e_tests {
         );
         set_tracking(false);
         assert_eq!(alloc_count(), 0);
-        assert_eq!(stats2.pages_full, 2);
-        assert_eq!(stats2.pages_residue, 1);
-        assert_eq!(stats2.residue_rows, 1808);
+        assert_eq!(stats2.pages_full, expected_full);
+        assert_eq!(stats2.pages_residue, if expected_rem == 0 { 0 } else { 1 });
         assert_eq!(stats2.rows_scanned, TOTAL as u64);
         assert!(out_len > 0);
         assert!(out_len <= 64);
@@ -1657,5 +1662,75 @@ mod e2e_tests {
             assert!(out_prices[k] >= 100);
             k += 1;
         }
+    }
+
+    #[test]
+    fn test_mmap_page_streaming_10000_rows_exact_remainder() {
+        const TOTAL: usize = 10_000;
+        let dir = std::env::temp_dir().join("tamil_mmap_10000_remainder");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("col.bin");
+        write_i64_column_bin(&path, TOTAL, |i| i as i64).unwrap();
+        let mut stream = ColumnarFileStream::open_i64(&path).unwrap();
+        let page_rows = stream.page_rows();
+        assert_eq!(page_rows, os_page_size_bytes() / core::mem::size_of::<i64>());
+        let expected_rem = TOTAL % page_rows;
+        let mut sum = 0usize;
+        let mut last_is_residue = false;
+        let mut last_n = 0usize;
+        while let Some(chunk) = stream.next_page_chunk() {
+            sum += chunk.row_count as usize;
+            last_is_residue = chunk.is_residue != 0;
+            last_n = chunk.row_count as usize;
+        }
+        assert_eq!(sum, TOTAL);
+        if expected_rem == 0 {
+            assert!(!last_is_residue);
+        } else {
+            assert!(last_is_residue);
+            assert_eq!(last_n, expected_rem);
+        }
+    }
+
+    #[test]
+    fn test_mmap_missing_file_returns_io_error_not_panic() {
+        let path = std::path::Path::new("/tmp/tamil_query_engine_missing_column_file_zzz.bin");
+        let err = ColumnarFileStream::open_i64(path)
+            .map(|_| ())
+            .map_err(EngineError::from);
+        assert!(matches!(err, Err(EngineError::IoError)));
+    }
+
+    #[test]
+    fn test_run_query_distinguishes_parse_vs_column_not_found() {
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+
+        let parse_err = run_query(
+            "வடிவமைப்பு | எடு 1;",
+            &catalog,
+            &mut arena,
+            &mut out,
+            &mut scratch,
+            &mut tokens,
+        );
+        assert!(matches!(parse_err, Err(EngineError::ParseFailed)));
+
+        let col_err = run_query(
+            "இருந்து பயனர்கள் | தேடு வடிவமைப்பு;",
+            &catalog,
+            &mut arena,
+            &mut out,
+            &mut scratch,
+            &mut tokens,
+        );
+        assert!(
+            matches!(col_err, Err(EngineError::ColumnNotFound { .. })),
+            "expected ColumnNotFound, got {col_err:?}"
+        );
+        assert!(!matches!(col_err, Err(EngineError::ParseFailed)));
     }
 }
