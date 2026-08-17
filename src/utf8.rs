@@ -63,6 +63,9 @@ pub const IS_OP_LUT: [u8; 256] = {
     t[b'<' as usize] = 1;
     t[b',' as usize] = 1;
     t[b';' as usize] = 1;
+    t[b'*' as usize] = 1;
+    t[b'+' as usize] = 1;
+    t[b'-' as usize] = 1;
     t
 };
 

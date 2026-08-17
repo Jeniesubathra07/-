@@ -1,10 +1,12 @@
 [package]
 name = "tamil_query_engine"
 version = "0.1.0"
+default-run = "tamil_query_engine"
 edition = "2021"
 description = "Microsecond-scale Tamil-native linear pipeline vector query engine and columnar database"
 license = "MIT"
 rust-version = "1.70"
+autobenches = false
 
 [lib]
 name = "tamil_query_engine"
@@ -14,14 +16,42 @@ path = "src/lib.rs"
 name = "tamil_query_engine"
 path = "src/main.rs"
 
+[[bin]]
+name = "stage3_bench"
+path = "benches/stage3_pipeline.rs"
+
+[[bin]]
+name = "sigbus_mmap_hazard"
+path = "src/bin/sigbus_mmap_hazard.rs"
+
+[[bin]]
+name = "audit_fuzz_driver"
+path = "src/bin/audit_fuzz_driver.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+# Persistence / length arithmetic must not silently wrap in release. Measured
+# Stage-3 demo pipeline overhead of this flag is reported in the audit notes;
+# correctness of external-file ingest outweighs the cost.
+# Final decision (Ω-FINAL-CONVERGENCE): keep overflow-checks = true.
+# Measured stage3_bench demo_pipeline (2000 iters, release): checks ON ≈ 1472 ns,
+# OFF ≈ 1844 ns (noise-dominated; derive path ~0.2% delta). Untrusted boundaries
+# (scan_number, Utf8 set_row / blob ingest, page byte offsets) also use checked_*
+# so the flag is defense-in-depth, not the sole control. Microsecond budget holds.
+overflow-checks = true
 
 [profile.bench]
 inherits = "release"
 
 [dev-dependencies]
+
+[dependencies]
+# Sole dependency: OS page mapping for Stage-4 columnar persistence.
+# Does not violate the "no std::alloc in hot path" invariant — mmap maps pages
+# via the OS virtual-memory subsystem, not the Rust allocator. Accessing mapped
+# memory is a load from an OS mapping, not a Vec/Box/String allocation.
+memmap2 = "0.9"

@@ -30,6 +30,8 @@ pub enum ParserError {
     EmptyInput = 4,
     /// Pipeline stage appeared before an `இருந்து` (Irundu) source was registered.
     MissingSourceContext = 5,
+    /// Integer literal overflowed `i64` during lex (sentinel `i64::MIN`).
+    NumberOverflow = 6,
 }
 
 /// AST / pipeline operator kind (alias for [`NodeKind`]; includes `Join`).
@@ -193,19 +195,41 @@ impl AstArena {
 }
 
 /// Linear recursive-descent-free parser over a fixed token window.
-#[repr(C)]
+///
+/// The token buffer is **caller-provided** (prefer a heap `Box` via
+/// [`alloc_token_window`]) so deep pipelines never place
+/// `[Token; MAX_TOKENS]` (~196 KiB) on the call stack.
+#[repr(C, align(64))]
 pub struct Parser<'a> {
     src: &'a [u8],
-    tokens: [Token; MAX_TOKENS],
+    tokens: &'a [Token; MAX_TOKENS],
     tok_len: usize,
     cursor: usize,
 }
 
+/// Cold-path token window — zeroed then ready for [`Lexer::tokenize_into`].
+#[inline(always)]
+pub fn alloc_token_window() -> Box<[Token; MAX_TOKENS]> {
+    use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+    unsafe {
+        let layout = Layout::new::<[Token; MAX_TOKENS]>();
+        let ptr = alloc_zeroed(layout) as *mut [Token; MAX_TOKENS];
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        Box::from_raw(ptr)
+    }
+}
+
 impl<'a> Parser<'a> {
-    pub fn try_from_source(src: &'a [u8]) -> Result<Self, ParserError> {
+    pub fn try_from_source(
+        src: &'a [u8],
+        tokens: &'a mut [Token; MAX_TOKENS],
+    ) -> Result<Self, ParserError> {
         let mut lexer = Lexer::new(src);
-        let mut tokens = [Token::eof(); MAX_TOKENS];
-        let tok_len = lexer.tokenize_into(&mut tokens).map_err(ParserError::from_lexer)?;
+        let tok_len = lexer
+            .tokenize_into(tokens)
+            .map_err(ParserError::from_lexer)?;
         Ok(Self {
             src,
             tokens,
@@ -215,15 +239,24 @@ impl<'a> Parser<'a> {
     }
 
     /// Backward-compatible constructor; empty token stream on lex failure.
-    pub fn from_source(src: &'a [u8]) -> Self {
-        match Self::try_from_source(src) {
-            Ok(p) => p,
-            Err(_) => Self {
+    pub fn from_source(src: &'a [u8], tokens: &'a mut [Token; MAX_TOKENS]) -> Self {
+        let mut lexer = Lexer::new(src);
+        match lexer.tokenize_into(tokens) {
+            Ok(tok_len) => Self {
                 src,
-                tokens: [Token::eof(); MAX_TOKENS],
-                tok_len: 1,
+                tokens,
+                tok_len,
                 cursor: 0,
             },
+            Err(_) => {
+                tokens[0] = Token::eof();
+                Self {
+                    src,
+                    tokens,
+                    tok_len: 1,
+                    cursor: 0,
+                }
+            }
         }
     }
 
@@ -252,6 +285,16 @@ impl<'a> Parser<'a> {
         } else {
             Err(ParserError::UnexpectedToken)
         }
+    }
+
+    /// Number token that is not the overflow sentinel (`i64::MIN`).
+    #[inline(always)]
+    fn expect_number(&mut self) -> Result<Token, ParserError> {
+        let t = self.expect(TokenKind::Number)?;
+        if t.number == i64::MIN {
+            return Err(ParserError::NumberOverflow);
+        }
+        Ok(t)
     }
 
     #[inline(always)]
@@ -318,7 +361,7 @@ impl<'a> Parser<'a> {
         if !op_ok {
             return Err(ParserError::UnexpectedToken);
         }
-        let lit_tok = self.expect(TokenKind::Number)?;
+        let lit_tok = self.expect_number()?;
         let lit = self.alloc_literal(arena, lit_tok)?;
         let bin = arena.try_alloc(AstNode {
             kind: NodeKind::BinOp,
@@ -363,7 +406,7 @@ impl<'a> Parser<'a> {
 
     fn parse_take(&mut self, arena: &mut AstArena) -> Result<u32, ParserError> {
         self.expect(TokenKind::Edu)?;
-        let n_tok = self.expect(TokenKind::Number)?;
+        let n_tok = self.expect_number()?;
         arena.try_alloc(AstNode {
             kind: NodeKind::Take,
             op: TokenKind::Edu,
@@ -396,10 +439,33 @@ impl<'a> Parser<'a> {
     fn parse_derive(&mut self, arena: &mut AstArena) -> Result<u32, ParserError> {
         self.expect(TokenKind::Kani)?;
         let col_tok = self.expect(TokenKind::Ident)?;
-        let col = self.alloc_ident(arena, col_tok)?;
+        let target = self.alloc_ident(arena, col_tok)?;
         self.expect(TokenKind::Eq)?;
-        let lit_tok = self.expect(TokenKind::Number)?;
-        let lit = self.alloc_literal(arena, lit_tok)?;
+        // RHS: <ident|number> [<*|+|-> <ident|number>]
+        let lhs = self.parse_derive_primary(arena)?;
+        let peek = self.peek().kind;
+        let is_arith = matches!(
+            peek,
+            TokenKind::Star | TokenKind::Plus | TokenKind::Minus
+        );
+        let expr = if is_arith {
+            let op_tok = self.bump();
+            let rhs = self.parse_derive_primary(arena)?;
+            arena.try_alloc(AstNode {
+                kind: NodeKind::BinOp,
+                op: op_tok.kind,
+                _pad: [0; 2],
+                start: op_tok.start,
+                end: op_tok.end,
+                value: 0,
+                left: lhs,
+                right: rhs,
+                next: NIL,
+            })?
+        } else {
+            // Bare literal / column assignment: wrap as identity add 0 via literal node.
+            lhs
+        };
         arena.try_alloc(AstNode {
             kind: NodeKind::Derive,
             op: TokenKind::Kani,
@@ -407,10 +473,26 @@ impl<'a> Parser<'a> {
             start: 0,
             end: 0,
             value: 0,
-            left: col,
-            right: lit,
+            left: target,
+            right: expr,
             next: NIL,
         })
+    }
+
+    #[inline(always)]
+    fn parse_derive_primary(&mut self, arena: &mut AstArena) -> Result<u32, ParserError> {
+        let t = self.peek();
+        match t.kind {
+            TokenKind::Ident => {
+                let tok = self.bump();
+                self.alloc_ident(arena, tok)
+            }
+            TokenKind::Number => {
+                let tok = self.expect_number()?;
+                self.alloc_literal(arena, tok)
+            }
+            _ => Err(ParserError::UnexpectedToken),
+        }
     }
 
     fn parse_group(&mut self, arena: &mut AstArena) -> Result<u32, ParserError> {
@@ -575,8 +657,15 @@ impl<'a> Parser<'a> {
 }
 
 /// Lex + parse a query into `arena`, surfacing arena / UTF-8 faults explicitly.
-pub fn parse_query(src: &[u8], arena: &mut AstArena) -> Result<u32, ParserError> {
-    let mut parser = Parser::try_from_source(src)?;
+///
+/// `tokens` must be a pre-allocated window (prefer [`alloc_token_window`]) so
+/// the parse path never places `[Token; MAX_TOKENS]` on the call stack.
+pub fn parse_query(
+    src: &[u8],
+    arena: &mut AstArena,
+    tokens: &mut [Token; MAX_TOKENS],
+) -> Result<u32, ParserError> {
+    let mut parser = Parser::try_from_source(src, tokens)?;
     parser.parse_pipeline(arena)
 }
 
@@ -588,7 +677,8 @@ mod tests {
     fn parses_demo_pipeline() {
         let q = "இருந்து பயனர்கள் | வடி வயது > 21 | அடுக்கு வயது | எடு 10 | தேடு பெயர், வயது;";
         let mut arena = AstArena::new();
-        let root = parse_query(q.as_bytes(), &mut arena).expect("parse");
+        let mut tokens = alloc_token_window();
+        let root = parse_query(q.as_bytes(), &mut arena, &mut tokens).expect("parse");
         let pipe = arena.get(root).unwrap();
         assert_eq!(pipe.kind, NodeKind::Pipeline);
         let mut stage = pipe.left;
@@ -613,7 +703,8 @@ mod tests {
         let mut arena = AstArena::new();
         // Saturate the flat structural boundary before parsing.
         arena.len = AST_CAP as u32;
-        let err = parse_query(q.as_bytes(), &mut arena).expect_err("must overflow");
+        let mut tokens = alloc_token_window();
+        let err = parse_query(q.as_bytes(), &mut arena, &mut tokens).expect_err("must overflow");
         assert_eq!(err, ParserError::ArenaOverflow);
         // No panic / no OOB — len stays at capacity.
         assert!(arena.is_full());
@@ -623,7 +714,8 @@ mod tests {
     fn missing_source_context_without_irundu() {
         let q = "வடி வயது > 21 | எடு 10;";
         let mut arena = AstArena::new();
-        let err = parse_query(q.as_bytes(), &mut arena).expect_err("need source");
+        let mut tokens = alloc_token_window();
+        let err = parse_query(q.as_bytes(), &mut arena, &mut tokens).expect_err("need source");
         assert_eq!(err, ParserError::MissingSourceContext);
     }
 }

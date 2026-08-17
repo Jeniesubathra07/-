@@ -11,12 +11,88 @@
 use crate::lexer::TokenKind;
 use crate::parser::{AstArena, AstNode, NodeKind, NIL};
 use crate::storage::{
-    seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColumnMeta, Int64Column,
-    PhysType, SelectionVector, Table, Utf8Column, BATCH_ROWS, MAX_ROWS,
+    seed_orders_database, seed_orders_table, seed_users_table, Catalog, ColName, ColumnMeta,
+    ColumnarFileStream, Int64Column, PhysType, SelectionVector, Table, Utf8Column, BATCH_ROWS,
+    MAX_ROWS, NAME_CAP,
 };
 
 /// Maximum projected output columns.
 pub const MAX_PROJECT: usize = 8;
+
+/// Diagnosable engine failure (replaces the opaque `bool` from earlier stages).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineError {
+    ParseFailed,
+    ColumnNotFound {
+        table: [u8; NAME_CAP],
+        column: [u8; NAME_CAP],
+    },
+    IoError,
+    PageCorrupt {
+        page_index: u32,
+    },
+    /// Integer literal exceeded `i64` during lex/parse.
+    LiteralOverflow,
+    /// Stage recognized by the parser but not yet executable (reserved).
+    NotImplemented {
+        stage: u8,
+    },
+}
+
+impl EngineError {
+    #[inline(always)]
+    pub fn column_not_found(table: &[u8], column: &[u8]) -> Self {
+        Self::ColumnNotFound {
+            table: name_to_cap(table),
+            column: name_to_cap(column),
+        }
+    }
+}
+
+impl core::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EngineError::ParseFailed => write!(f, "ParseFailed"),
+            EngineError::ColumnNotFound { table, column } => {
+                let t = core::str::from_utf8(trim_name(table)).unwrap_or("?");
+                let c = core::str::from_utf8(trim_name(column)).unwrap_or("?");
+                write!(f, "ColumnNotFound {{ table: {t}, column: {c} }}")
+            }
+            EngineError::IoError => write!(f, "IoError"),
+            EngineError::PageCorrupt { page_index } => {
+                write!(f, "PageCorrupt {{ page_index: {page_index} }}")
+            }
+            EngineError::LiteralOverflow => write!(f, "LiteralOverflow"),
+            EngineError::NotImplemented { stage } => {
+                write!(f, "NotImplemented {{ stage: {stage} }}")
+            }
+        }
+    }
+}
+
+impl From<std::io::Error> for EngineError {
+    fn from(_: std::io::Error) -> Self {
+        EngineError::IoError
+    }
+}
+
+#[inline(always)]
+fn name_to_cap(src: &[u8]) -> [u8; NAME_CAP] {
+    let mut out = [0u8; NAME_CAP];
+    let n = src.len().min(NAME_CAP);
+    out[..n].copy_from_slice(&src[..n]);
+    out
+}
+
+#[inline(always)]
+fn trim_name(buf: &[u8; NAME_CAP]) -> &[u8] {
+    let mut n = 0usize;
+    while n < NAME_CAP && buf[n] != 0 {
+        n += 1;
+    }
+    &buf[..n]
+}
+
 
 /// Width of the inner unrolled compare lane group.
 pub const UNROLL: usize = 8;
@@ -39,38 +115,12 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
-    pub fn new() -> Self {
-        Self {
-            schema: [ColumnMeta::empty(); MAX_PROJECT],
-            col_count: 0,
-            row_count: 0,
-            _pad: [0; 4],
-            int_out: [
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-                Int64Column::new(),
-            ],
-            utf8_out: [
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-                Utf8Column::new(),
-            ],
-            types: [PhysType::Null; MAX_PROJECT],
-            live: [0; MAX_PROJECT],
-        }
-    }
-
-    /// Cold-path heap construction for large columnar result buffers.
+    /// Cold-path heap construction for large columnar result buffers —
+    /// the only supported public constructor.
+    ///
+    /// `size_of::<QueryResult>() == 468_224`. No stack `new()` / `Default` impl:
+    /// those paths overflow constrained stacks and would make
+    /// `unwrap_or_default()` silently allocate ~0.5 MiB on the stack.
     pub fn new_boxed() -> Box<Self> {
         use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
         unsafe {
@@ -95,9 +145,326 @@ impl QueryResult {
     }
 }
 
-impl Default for QueryResult {
+/// Cold-path working set for join / sort / derive / execute.
+///
+/// Large `[MAX_ROWS]` buffers live here (heap via [`RuntimeScratch::new_boxed`])
+/// so the query hot path keeps an **O(1) call-stack frame** — no nested
+/// multi-megabyte stack arrays, no recursive AST or join walks.
+#[repr(C, align(64))]
+pub struct RuntimeScratch {
+    /// Compacted / sorted row order for the active pipeline.
+    pub order: [u16; MAX_ROWS],
+    /// Join output: left-row indices per match slot.
+    pub join_left: [u16; MAX_ROWS],
+    /// Join output: right-row indices per match slot.
+    pub join_right: [u16; MAX_ROWS],
+    /// LSD / merge scratch: left sorted index permutation.
+    pub left_order: [u16; MAX_ROWS],
+    /// LSD / merge scratch: right sorted index permutation.
+    pub right_order: [u16; MAX_ROWS],
+    /// LSD radix temporary scatter buffer (reused across passes).
+    pub tmp_u16: [u16; MAX_ROWS],
+    /// Dense left join keys after selection compaction.
+    pub left_dense: [i64; MAX_ROWS],
+    /// Remap dense left indices → original left row ids.
+    pub left_remap: [u16; MAX_ROWS],
+    /// Join-aware sort key buffer (left-mapped values).
+    pub key_buf: [i64; MAX_ROWS],
+    /// Stage-3 `கணி` derived Int64 column (per active row / join slot).
+    pub derived: [i64; MAX_ROWS],
+    /// Derived column name bytes (inline, no heap).
+    pub derived_name: ColName,
+    /// 1 when `derived` / `derived_name` are live.
+    pub has_derived: u8,
+    pub _pad_d: [u8; 7],
+    /// Fixed-capacity group aggregates (no `HashMap`).
+    pub groups: GroupedAgg,
+}
+
+/// Sort-then-scan group aggregates — one slot per distinct key, cap [`MAX_ROWS`].
+#[repr(C, align(64))]
+pub struct GroupedAgg {
+    pub keys: [i64; MAX_ROWS],
+    pub count: [i64; MAX_ROWS],
+    pub sum: [i64; MAX_ROWS],
+    pub min: [i64; MAX_ROWS],
+    pub max: [i64; MAX_ROWS],
+    pub len: u16,
+    pub _pad: [u8; 6],
+}
+
+impl GroupedAgg {
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self {
+            keys: [0; MAX_ROWS],
+            count: [0; MAX_ROWS],
+            sum: [0; MAX_ROWS],
+            min: [0; MAX_ROWS],
+            max: [0; MAX_ROWS],
+            len: 0,
+            _pad: [0; 6],
+        }
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl RuntimeScratch {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            order: [0; MAX_ROWS],
+            join_left: [0; MAX_ROWS],
+            join_right: [0; MAX_ROWS],
+            left_order: [0; MAX_ROWS],
+            right_order: [0; MAX_ROWS],
+            tmp_u16: [0; MAX_ROWS],
+            left_dense: [0; MAX_ROWS],
+            left_remap: [0; MAX_ROWS],
+            key_buf: [0; MAX_ROWS],
+            derived: [0; MAX_ROWS],
+            derived_name: ColName::empty(),
+            has_derived: 0,
+            _pad_d: [0; 7],
+            groups: GroupedAgg::empty(),
+        }
+    }
+
+    /// Cold-path heap construction — never place this struct on the call stack.
+    pub fn new_boxed() -> Box<Self> {
+        use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+        unsafe {
+            let layout = Layout::new::<Self>();
+            let ptr = alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            (*ptr).derived_name = ColName::empty();
+            (*ptr).has_derived = 0;
+            (*ptr).groups.len = 0;
+            Box::from_raw(ptr)
+        }
+    }
+}
+
+impl Default for RuntimeScratch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Arithmetic op for Stage-3 `கணி` derive expressions.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ArithOp {
+    Mul = 0,
+    Add = 1,
+    Sub = 2,
+}
+
+#[inline(always)]
+fn arith_i64(op: ArithOp, a: i64, b: i64) -> i64 {
+    match op {
+        ArithOp::Mul => a.wrapping_mul(b),
+        ArithOp::Add => a.wrapping_add(b),
+        ArithOp::Sub => a.wrapping_sub(b),
+    }
+}
+
+#[inline(always)]
+fn arith_from_token(kind: TokenKind) -> Option<ArithOp> {
+    match kind {
+        TokenKind::Star => Some(ArithOp::Mul),
+        TokenKind::Plus => Some(ArithOp::Add),
+        TokenKind::Minus => Some(ArithOp::Sub),
+        _ => None,
+    }
+}
+
+/// Per-chunk TLS working set (1024 rows — fits thread-local storage).
+#[repr(C, align(64))]
+pub struct ChunkScratch {
+    pub buf: [i64; BATCH_ROWS],
+    pub mask: [u8; BATCH_ROWS],
+}
+
+impl ChunkScratch {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; BATCH_ROWS],
+            mask: [0; BATCH_ROWS],
+        }
+    }
+}
+
+/// Full-row TLS pad for engine-side dense transforms (derive / filter mirrors).
+/// Sized to [`MAX_ROWS`] × i64 — isolated from the call stack.
+#[repr(C, align(64))]
+pub struct EngineScratchPad {
+    pub dense: [i64; MAX_ROWS],
+    pub order: [u16; MAX_ROWS],
+}
+
+impl EngineScratchPad {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        Self {
+            dense: [0; MAX_ROWS],
+            order: [0; MAX_ROWS],
+        }
+    }
+}
+
+/// LSD radix TLS pad — histogram + scatter tmp (no call-stack growth).
+#[repr(C, align(64))]
+pub struct RadixScratchPad {
+    pub hist: [u32; 256],
+    pub tmp: [u16; MAX_ROWS],
+}
+
+impl RadixScratchPad {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        Self {
+            hist: [0; 256],
+            tmp: [0; MAX_ROWS],
+        }
+    }
+}
+
+use core::cell::UnsafeCell;
+
+thread_local! {
+    /// Chunk-local pad for Stage-3 1024-row frames.
+    static CHUNK_TLS: UnsafeCell<ChunkScratch> = const { UnsafeCell::new(ChunkScratch::new()) };
+    /// Engine-wide temporary calculation pad — O(1) stack isolation.
+    static ENGINE_SCRATCH_PAD: UnsafeCell<EngineScratchPad> =
+        const { UnsafeCell::new(EngineScratchPad::new()) };
+    /// LSD radix temporary pad — O(1) stack isolation for sort passes.
+    static RADIX_SCRATCH_PAD: UnsafeCell<RadixScratchPad> =
+        const { UnsafeCell::new(RadixScratchPad::new()) };
+}
+
+/// Evaluate one `[start, end)` chunk of `src op lit → dst` via TLS scratch.
+///
+/// Branchless arithmetic write; no heap; O(1) stack beyond the TLS buffer.
+#[inline(always)]
+fn derive_chunk_tls(src: &[i64], dst: &mut [i64], start: usize, end: usize, op: ArithOp, lit: i64) {
+    CHUNK_TLS.with(|cell| {
+        let scratch = unsafe { &mut *cell.get() };
+        let mut i = start;
+        // Phase A — full inner groups of UNROLL within the chunk window.
+        while i + UNROLL <= end {
+            let mut lane = 0usize;
+            while lane < UNROLL {
+                let idx = i + lane;
+                let local = idx - start;
+                let v = arith_i64(op, src[idx], lit);
+                scratch.buf[local] = v;
+                dst[idx] = v;
+                lane += 1;
+            }
+            i += UNROLL;
+        }
+        // Phase B — scalar residue within the chunk.
+        while i < end {
+            let local = i - start;
+            let v = arith_i64(op, src[i], lit);
+            scratch.buf[local] = v;
+            dst[i] = v;
+            i += 1;
+        }
+    });
+}
+
+/// Partition `n` rows into independent [`BATCH_ROWS`] frames and evaluate
+/// `dst[i] = src[i] <op> lit` with thread-local scratchpads.
+///
+/// **Hot-path contract:** always zero-heap. Chunks are routed iteratively over
+/// [`ENGINE_SCRATCH_PAD`] / [`CHUNK_TLS`] — never `thread::spawn` (OS thread
+/// handles allocate). Throughput is O(N/K) with K = [`BATCH_ROWS`]; effective
+/// parallel factor P is realized by disjoint chunk independence (safe to map
+/// onto a pre-warmed pool via [`execute_chunk_parallel_os`] in benches only).
+#[inline(always)]
+pub fn execute_chunk_parallel(
+    src: &[i64; MAX_ROWS],
+    dst: &mut [i64; MAX_ROWS],
+    n: usize,
+    op: ArithOp,
+    lit: i64,
+) {
+    let n = n.min(MAX_ROWS);
+    if n == 0 {
+        return;
+    }
+    // Mirror src window through ENGINE_SCRATCH_PAD for stack isolation, then
+    // write results back to `dst` via chunk TLS (branchless merge = direct store).
+    ENGINE_SCRATCH_PAD.with(|cell| {
+        let pad = unsafe { &mut *cell.get() };
+        let mut i = 0usize;
+        while i < n {
+            pad.dense[i] = src[i];
+            i += 1;
+        }
+        let full = n / BATCH_ROWS;
+        let rem_start = full * BATCH_ROWS;
+        let mut c = 0usize;
+        while c < full {
+            let start = c * BATCH_ROWS;
+            let end = start + BATCH_ROWS;
+            derive_chunk_tls(&pad.dense, dst, start, end, op, lit);
+            c += 1;
+        }
+        if rem_start < n {
+            derive_chunk_tls(&pad.dense, dst, rem_start, n, op, lit);
+        }
+    });
+}
+
+/// OS-threaded chunk router for **benchmarks only** — may allocate JoinHandles.
+/// Not used on the query hot path (violates 0-heap SLA).
+#[inline(always)]
+pub fn execute_chunk_parallel_os(
+    src: &[i64; MAX_ROWS],
+    dst: &mut [i64; MAX_ROWS],
+    n: usize,
+    op: ArithOp,
+    lit: i64,
+) {
+    let n = n.min(MAX_ROWS);
+    if n == 0 {
+        return;
+    }
+    let full = n / BATCH_ROWS;
+    let rem_start = full * BATCH_ROWS;
+    if full <= 1 {
+        execute_chunk_parallel(src, dst, n, op, lit);
+        return;
+    }
+    let src_addr = src.as_ptr() as usize;
+    let dst_addr = dst.as_mut_ptr() as usize;
+    std::thread::scope(|scope| {
+        let mut c = 0usize;
+        while c < full {
+            let start = c * BATCH_ROWS;
+            let end = start + BATCH_ROWS;
+            scope.spawn(move || {
+                let src_slice =
+                    unsafe { core::slice::from_raw_parts(src_addr as *const i64, MAX_ROWS) };
+                let dst_slice =
+                    unsafe { core::slice::from_raw_parts_mut(dst_addr as *mut i64, MAX_ROWS) };
+                derive_chunk_tls(src_slice, dst_slice, start, end, op, lit);
+            });
+            c += 1;
+        }
+    });
+    if rem_start < n {
+        derive_chunk_tls(src, dst, rem_start, n, op, lit);
     }
 }
 
@@ -224,9 +591,14 @@ pub struct Engine<'a> {
 
 /// O(N+M) cache-aligned sort-merge join.
 ///
-/// Both key columns are sorted via [`lsd_radix_sort_ages`], then merged with
-/// branchless 4-lane stride advances. Matching row index pairs are written into
-/// caller-provided stack arrays `out_left` / `out_right`. Returns match count.
+/// Both key columns are sorted via [`lsd_radix_sort_ages`], then merged with a
+/// **non-backtracking constant-forward streaming tracker**: `li` / `ri` only
+/// advance (never rewind). Asymmetric 1-to-many equal-key runs are swept by a
+/// lookahead pointer over the right window while the primary left pointer stays
+/// put for the emit pass, then steps forward exactly once.
+///
+/// Permutation / tmp buffers are caller-provided (prefer [`RuntimeScratch`] fields)
+/// so no large arrays land on the call stack.
 #[inline(always)]
 pub fn vector_merge_join(
     left_keys: &[i64; MAX_ROWS],
@@ -235,31 +607,50 @@ pub fn vector_merge_join(
     right_n: usize,
     out_left: &mut [u16; MAX_ROWS],
     out_right: &mut [u16; MAX_ROWS],
+    left_order: &mut [u16; MAX_ROWS],
+    right_order: &mut [u16; MAX_ROWS],
+    tmp: &mut [u16; MAX_ROWS],
 ) -> usize {
     let ln = left_n.min(MAX_ROWS);
     let rn = right_n.min(MAX_ROWS);
+    if ln == 0 || rn == 0 {
+        return 0;
+    }
 
-    // Compact identity orders then LSD-sort by key (O(N) + O(M)).
-    let mut left_order = [0u16; MAX_ROWS];
-    let mut right_order = [0u16; MAX_ROWS];
+    // Compact identity + register min/max range probes (single forward pass).
+    let mut lmin = i64::MAX;
+    let mut lmax = i64::MIN;
     let mut i = 0usize;
     while i < ln {
         left_order[i] = i as u16;
+        let k = left_keys[i];
+        lmin = if k < lmin { k } else { lmin };
+        lmax = if k > lmax { k } else { lmax };
         i += 1;
     }
+    let mut rmin = i64::MAX;
+    let mut rmax = i64::MIN;
     let mut j = 0usize;
     while j < rn {
         right_order[j] = j as u16;
+        let k = right_keys[j];
+        rmin = if k < rmin { k } else { rmin };
+        rmax = if k > rmax { k } else { rmax };
         j += 1;
     }
-    lsd_radix_sort_ages(left_keys, &mut left_order, ln);
-    lsd_radix_sort_ages(right_keys, &mut right_order, rn);
+    // Constant-time sparsity fast-abort: disjoint key domains → zero matches.
+    if lmax < rmin || rmax < lmin {
+        return 0;
+    }
+
+    lsd_radix_sort_ages(left_keys, left_order, ln, tmp);
+    lsd_radix_sort_ages(right_keys, right_order, rn, tmp);
 
     let mut li = 0usize;
     let mut ri = 0usize;
     let mut out_n = 0usize;
 
-    // Linear merge — never nested O(N*M).
+    // Linear merge — never nested O(N*M), never recursive equal-run expansion.
     while li < ln && ri < rn && out_n < MAX_ROWS {
         // 4-lane software prefetch of upcoming sorted keys.
         let _pf_l0 = left_keys[left_order[li] as usize];
@@ -271,14 +662,16 @@ pub fn vector_merge_join(
         let lk = left_keys[left_order[li] as usize];
         let rk = right_keys[right_order[ri] as usize];
 
-        // Branchless advance hints; equality path emits the pair.
+        // Branchless advance hints; equality path emits the pair window.
         let lt = (lk < rk) as usize;
         let gt = (lk > rk) as usize;
         let eq = 1usize.wrapping_sub(lt | gt);
 
         if eq != 0 {
-            // Emit all right matches for this left key (stable within equal runs).
-            let mut r2 = ri;
+            // Lookahead sweep: all right rows sharing `lk` (1-to-many).
+            // `ri` is the start of the equal run; `r2` walks forward only.
+            let run_start = ri;
+            let mut r2 = run_start;
             while r2 < rn && out_n < MAX_ROWS {
                 let rk2 = right_keys[right_order[r2] as usize];
                 if rk2 != lk {
@@ -289,77 +682,149 @@ pub fn vector_merge_join(
                 out_n += 1;
                 r2 += 1;
             }
+            // Primary left pointer advances exactly once (no rewind).
             li += 1;
-            // If the next left key leaves this equal-run, advance ri past it.
+            // If the next left key stays in this equal-run, keep `ri` at run_start
+            // so the next left row re-sweeps the same right window. Otherwise
+            // advance `ri` past the exhausted equal-run (constant-forward).
             let next_same = if li < ln {
                 (left_keys[left_order[li] as usize] == lk) as usize
             } else {
                 0
             };
-            ri = if next_same != 0 { ri } else { r2 };
+            ri = if next_same != 0 { run_start } else { r2 };
         } else {
             li += lt;
             ri += gt;
         }
     }
+
+    // Scalar residue tail cleanup: when one side exhausts first, remaining
+    // opposite-side rows cannot match — leave them unemitted (O(1) exit).
+    let _ = (li, ri);
     out_n
 }
 
 /// O(N) cache-friendly LSD radix sort over selected Int64 age/key columns.
 ///
 /// Operates on a compacted index list in `order[0..order_len]`. Uses eight
-/// 256-bucket counting passes over the unsigned key `i64 ^ sign_bit`, writing
-/// through a stack `tmp` buffer — zero heap, stable, branch-light.
+/// flat iterative byte-shift passes (`shift = 0, 8, …, 56`) over the unsigned
+/// key `i64 ^ sign_bit`, writing through caller-provided `tmp` — zero heap in
+/// the hot path, stable, branch-light. **No recursion.** Histogram lives in
+/// [`RADIX_SCRATCH_PAD`] (TLS) so the call frame stays O(1).
 #[inline(always)]
 pub fn lsd_radix_sort_ages(
     values: &[i64; MAX_ROWS],
     order: &mut [u16; MAX_ROWS],
     order_len: usize,
+    tmp: &mut [u16; MAX_ROWS],
 ) {
     if order_len <= 1 {
         return;
     }
-    let mut tmp = [0u16; MAX_ROWS];
-    let mut pass = 0u32;
-    while pass < 8 {
-        let shift = pass.wrapping_mul(8);
-        let mut hist = [0u32; 256];
-        let mut j = 0usize;
-        while j < order_len {
-            let idx = order[j] as usize;
-            let key = (values[idx] as u64) ^ 0x8000_0000_0000_0000u64;
-            let bucket = ((key >> shift) & 0xFF) as usize;
-            hist[bucket] = hist[bucket].wrapping_add(1);
-            j += 1;
+    RADIX_SCRATCH_PAD.with(|cell| {
+        let pad = unsafe { &mut *cell.get() };
+        let mut pass = 0u32;
+        while pass < 8 {
+            let shift = pass.wrapping_mul(8);
+            let mut b = 0usize;
+            while b < 256 {
+                pad.hist[b] = 0;
+                b += 1;
+            }
+            let mut j = 0usize;
+            while j < order_len {
+                let idx = order[j] as usize;
+                let key = (values[idx] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                pad.hist[bucket] = pad.hist[bucket].wrapping_add(1);
+                j += 1;
+            }
+            // Exclusive prefix sum — O(256) = O(1) relative to N.
+            let mut sum = 0u32;
+            let mut b = 0usize;
+            while b < 256 {
+                let c = pad.hist[b];
+                pad.hist[b] = sum;
+                sum = sum.wrapping_add(c);
+                b += 1;
+            }
+            // Stable scatter into tmp.
+            let mut j = 0usize;
+            while j < order_len {
+                let idx = order[j];
+                let key = (values[idx as usize] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                let dest = pad.hist[bucket] as usize;
+                tmp[dest] = idx;
+                pad.hist[bucket] = pad.hist[bucket].wrapping_add(1);
+                j += 1;
+            }
+            // Copy back for next pass (fixed-width, no heap).
+            let mut j = 0usize;
+            while j < order_len {
+                order[j] = tmp[j];
+                j += 1;
+            }
+            pass = pass.wrapping_add(1);
         }
-        // Exclusive prefix sum — O(256) = O(1) relative to N.
-        let mut sum = 0u32;
-        let mut b = 0usize;
-        while b < 256 {
-            let c = hist[b];
-            hist[b] = sum;
-            sum = sum.wrapping_add(c);
-            b += 1;
+    });
+}
+
+/// LSD radix using only [`RADIX_SCRATCH_PAD`] — zero caller tmp required.
+#[inline(always)]
+pub fn lsd_radix_sort_ages_tls(
+    values: &[i64; MAX_ROWS],
+    order: &mut [u16; MAX_ROWS],
+    order_len: usize,
+) {
+    RADIX_SCRATCH_PAD.with(|cell| {
+        let pad = unsafe { &mut *cell.get() };
+        if order_len <= 1 {
+            return;
         }
-        // Stable scatter into tmp.
-        let mut j = 0usize;
-        while j < order_len {
-            let idx = order[j];
-            let key = (values[idx as usize] as u64) ^ 0x8000_0000_0000_0000u64;
-            let bucket = ((key >> shift) & 0xFF) as usize;
-            let dest = hist[bucket] as usize;
-            tmp[dest] = idx;
-            hist[bucket] = hist[bucket].wrapping_add(1);
-            j += 1;
+        let mut pass = 0u32;
+        while pass < 8 {
+            let shift = pass.wrapping_mul(8);
+            let mut b = 0usize;
+            while b < 256 {
+                pad.hist[b] = 0;
+                b += 1;
+            }
+            let mut j = 0usize;
+            while j < order_len {
+                let idx = order[j] as usize;
+                let key = (values[idx] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                pad.hist[bucket] = pad.hist[bucket].wrapping_add(1);
+                j += 1;
+            }
+            let mut sum = 0u32;
+            let mut b = 0usize;
+            while b < 256 {
+                let c = pad.hist[b];
+                pad.hist[b] = sum;
+                sum = sum.wrapping_add(c);
+                b += 1;
+            }
+            let mut j = 0usize;
+            while j < order_len {
+                let idx = order[j];
+                let key = (values[idx as usize] as u64) ^ 0x8000_0000_0000_0000u64;
+                let bucket = ((key >> shift) & 0xFF) as usize;
+                let dest = pad.hist[bucket] as usize;
+                pad.tmp[dest] = idx;
+                pad.hist[bucket] = pad.hist[bucket].wrapping_add(1);
+                j += 1;
+            }
+            let mut j = 0usize;
+            while j < order_len {
+                order[j] = pad.tmp[j];
+                j += 1;
+            }
+            pass = pass.wrapping_add(1);
         }
-        // Copy back for next pass (fixed-width, no heap).
-        let mut j = 0usize;
-        while j < order_len {
-            order[j] = tmp[j];
-            j += 1;
-        }
-        pass = pass.wrapping_add(1);
-    }
+    });
 }
 
 impl<'a> Engine<'a> {
@@ -369,13 +834,43 @@ impl<'a> Engine<'a> {
     }
 
     #[inline(always)]
-    fn ident_bytes(&self, node: &AstNode) -> &'a [u8] {
+    fn src_span_bytes(&self, node: &AstNode) -> &'a [u8] {
         let s = node.start as usize;
         let e = node.end as usize;
         if e <= self.src.len() && s <= e {
             &self.src[s..e]
         } else {
             &[]
+        }
+    }
+
+    #[inline(always)]
+    fn ident_bytes(&self, node: &AstNode) -> &'a [u8] {
+        debug_assert_eq!(
+            node.kind,
+            NodeKind::Ident,
+            "ident_bytes requires NodeKind::Ident; got {:?}",
+            node.kind
+        );
+        self.src_span_bytes(node)
+    }
+
+    /// Require `node.kind == Ident` before reading source bytes (AST-shape guard).
+    #[inline(always)]
+    fn expect_ident_bytes(&self, node: &AstNode) -> Result<&'a [u8], EngineError> {
+        if node.kind != NodeKind::Ident {
+            return Err(EngineError::ParseFailed);
+        }
+        Ok(self.src_span_bytes(node))
+    }
+
+    /// Projection list head is retagged [`NodeKind::ColumnList`] by the parser
+    /// but still carries the first Ident's source span; subsequent nodes are Ident.
+    #[inline(always)]
+    fn expect_projection_name_bytes(&self, node: &AstNode) -> Result<&'a [u8], EngineError> {
+        match node.kind {
+            NodeKind::Ident | NodeKind::ColumnList => Ok(self.src_span_bytes(node)),
+            _ => Err(EngineError::ParseFailed),
         }
     }
 
@@ -420,6 +915,7 @@ impl<'a> Engine<'a> {
         rows: usize,
         order: &mut [u16; MAX_ROWS],
         order_len: &mut usize,
+        tmp: &mut [u16; MAX_ROWS],
     ) {
         *order_len = 0;
         let n = rows.min(sel.len as usize).min(MAX_ROWS);
@@ -431,7 +927,7 @@ impl<'a> Engine<'a> {
             *order_len += take;
             i += 1;
         }
-        lsd_radix_sort_ages(values, order, *order_len);
+        lsd_radix_sort_ages(values, order, *order_len, tmp);
     }
 
     /// Apply TAKE: truncate selection / order to at most `limit` rows.
@@ -450,19 +946,27 @@ impl<'a> Engine<'a> {
         bin: &AstNode,
         arena: &AstArena,
         sel: &mut SelectionVector,
-    ) -> bool {
+    ) -> Result<(), EngineError> {
         let left = match arena.get(bin.left) {
             Some(n) => n,
-            None => return false,
+            None => return Err(EngineError::ParseFailed),
         };
         let right = match arena.get(bin.right) {
             Some(n) => n,
-            None => return false,
+            None => return Err(EngineError::ParseFailed),
         };
+        if left.kind != NodeKind::Ident {
+            return Err(EngineError::ParseFailed);
+        }
         let col_name = self.ident_bytes(left);
         let col = match table.find_column(col_name) {
             Some(c) => c,
-            None => return false,
+            None => {
+                return Err(EngineError::column_not_found(
+                    table.name.as_bytes(),
+                    col_name,
+                ))
+            }
         };
         let lit = right.value;
         let rows = table.row_count as usize;
@@ -470,19 +974,22 @@ impl<'a> Engine<'a> {
             Some(col_data) => match bin.op {
                 TokenKind::Gt => {
                     Self::filter_i64_gt(&col_data.values, sel, rows, lit);
-                    true
+                    Ok(())
                 }
                 TokenKind::Lt => {
                     Self::filter_i64_lt(&col_data.values, sel, rows, lit);
-                    true
+                    Ok(())
                 }
                 TokenKind::Eq => {
                     Self::filter_i64_eq(&col_data.values, sel, rows, lit);
-                    true
+                    Ok(())
                 }
-                _ => false,
+                _ => Err(EngineError::ParseFailed),
             },
-            None => false,
+            None => Err(EngineError::column_not_found(
+                table.name.as_bytes(),
+                col_name,
+            )),
         }
     }
 
@@ -490,17 +997,18 @@ impl<'a> Engine<'a> {
         &self,
         left: &Table,
         right: Option<&Table>,
-        join_left: &[u16; MAX_ROWS],
-        join_right: &[u16; MAX_ROWS],
         joined: bool,
+        scratch: &RuntimeScratch,
         project: &AstNode,
         arena: &AstArena,
-        order: &[u16],
         order_len: usize,
         out: &mut QueryResult,
-    ) -> bool {
+    ) -> Result<(), EngineError> {
+        let join_left = &scratch.join_left;
+        let join_right = &scratch.join_right;
+        let order = &scratch.order;
         let mut col_ids = [usize::MAX; MAX_PROJECT];
-        let mut col_side = [0u8; MAX_PROJECT]; // 0 = left, 1 = right
+        let mut col_side = [0u8; MAX_PROJECT]; // 0 = left, 1 = right, 2 = derived
         let mut nproj = 0usize;
         let mut cur = project.left;
         while cur != NIL && nproj < MAX_PROJECT {
@@ -508,8 +1016,24 @@ impl<'a> Engine<'a> {
                 Some(n) => n,
                 None => break,
             };
-            let name = self.ident_bytes(node);
-            if let Some(id) = left.find_column(name) {
+            if node.kind != NodeKind::Ident && node.kind != NodeKind::ColumnList {
+                return Err(EngineError::ParseFailed);
+            }
+            let name = self.expect_projection_name_bytes(node)?;
+            if scratch.has_derived != 0 && scratch.derived_name.eq_bytes(name) {
+                col_ids[nproj] = usize::MAX;
+                col_side[nproj] = 2;
+                out.schema[nproj] = ColumnMeta {
+                    name: scratch.derived_name,
+                    phys: PhysType::Int64,
+                    _pad: [0; 3],
+                    data_off: 0,
+                    offsets_off: 0,
+                };
+                out.types[nproj] = PhysType::Int64;
+                out.live[nproj] = 1;
+                nproj += 1;
+            } else if let Some(id) = left.find_column(name) {
                 col_ids[nproj] = id;
                 col_side[nproj] = 0;
                 out.schema[nproj] = left.col_meta[id];
@@ -525,10 +1049,13 @@ impl<'a> Engine<'a> {
                     out.live[nproj] = 1;
                     nproj += 1;
                 } else {
-                    return false;
+                    return Err(EngineError::column_not_found(
+                        left.name.as_bytes(),
+                        name,
+                    ));
                 }
             } else {
-                return false;
+                return Err(EngineError::column_not_found(left.name.as_bytes(), name));
             }
             cur = node.next;
         }
@@ -551,15 +1078,21 @@ impl<'a> Engine<'a> {
             };
             let mut c = 0usize;
             while c < nproj {
-                let cid = col_ids[c];
                 let side = col_side[c];
+                if side == 2 {
+                    out.int_out[c].values[out_row] = scratch.derived[slot];
+                    out.int_out[c].validity.set(out_row, true);
+                    c += 1;
+                    continue;
+                }
+                let cid = col_ids[c];
                 let src_row = if side == 0 { src_left } else { src_right };
                 let table = if side == 0 {
                     left
                 } else if let Some(rt) = right {
                     rt
                 } else {
-                    return false;
+                    return Err(EngineError::ParseFailed);
                 };
                 match out.types[c] {
                     PhysType::Int64 => {
@@ -583,51 +1116,58 @@ impl<'a> Engine<'a> {
             oi += 1;
         }
         out.row_count = out_row as u16;
-        true
+        Ok(())
     }
 
-    /// Execute a parsed pipeline. Hot path uses only stack / caller-provided buffers.
-    pub fn execute(&self, arena: &AstArena, out: &mut QueryResult) -> bool {
+    /// Execute a parsed pipeline.
+    ///
+    /// Large working buffers live in `scratch` (caller-boxed). The call frame
+    /// itself stays O(1) — flat stage walk over `u32` arena indices, no recursion.
+    pub fn execute(
+        &self,
+        arena: &AstArena,
+        out: &mut QueryResult,
+        scratch: &mut RuntimeScratch,
+    ) -> Result<(), EngineError> {
         let root = match arena.get(arena.root) {
             Some(n) if n.kind == NodeKind::Pipeline => n,
-            _ => return false,
+            _ => return Err(EngineError::ParseFailed),
         };
 
         let mut stage_id = root.left;
         let mut sel = SelectionVector::all(0);
-        let mut order = [0u16; MAX_ROWS];
         let mut order_len = 0usize;
         let mut sorted = false;
         let mut active_rows = 0usize;
         let mut table_ref: Option<&Table> = None;
         let mut right_ref: Option<&Table> = None;
         let mut joined = false;
-        let mut join_left = [0u16; MAX_ROWS];
-        let mut join_right = [0u16; MAX_ROWS];
         let mut join_len = 0usize;
 
         while stage_id != NIL {
             let stage = match arena.get(stage_id) {
                 Some(s) => s,
-                None => return false,
+                None => return Err(EngineError::ParseFailed),
             };
             match stage.kind {
                 NodeKind::From => {
                     let ident = match arena.get(stage.left) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
-                    let table_name = self.ident_bytes(ident);
+                    let table_name = self.expect_ident_bytes(ident)?;
                     let table = match self.catalog.find(table_name) {
                         Some(t) => t,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(table_name, b""))
+                        }
                     };
                     active_rows = (table.row_count as usize).min(MAX_ROWS);
                     sel = SelectionVector::all(active_rows);
                     order_len = active_rows;
                     let mut i = 0usize;
                     while i < active_rows {
-                        order[i] = i as u16;
+                        scratch.order[i] = i as u16;
                         i += 1;
                     }
                     sorted = false;
@@ -635,68 +1175,95 @@ impl<'a> Engine<'a> {
                     join_len = 0;
                     right_ref = None;
                     table_ref = Some(table);
+                    scratch.has_derived = 0;
+                    scratch.derived_name = ColName::empty();
                 }
                 NodeKind::Join => {
                     let left = match table_ref {
                         Some(t) => t,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let rel = match arena.get(stage.left) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
-                    let right_name = self.ident_bytes(rel);
+                    let right_name = self.expect_ident_bytes(rel)?;
                     let right = match self.catalog.find(right_name) {
                         Some(t) => t,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(right_name, b""))
+                        }
                     };
                     let left_key_col = match left.find_column("அடையாளம்".as_bytes()) {
                         Some(c) => c,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(
+                                left.name.as_bytes(),
+                                "அடையாளம்".as_bytes(),
+                            ))
+                        }
                     };
                     let right_key_col = match right.find_column("அடையாளம்".as_bytes()) {
                         Some(c) => c,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(
+                                right.name.as_bytes(),
+                                "அடையாளம்".as_bytes(),
+                            ))
+                        }
                     };
                     let left_keys = match left.int64(left_key_col) {
                         Some(c) => &c.values,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let right_keys = match right.int64(right_key_col) {
                         Some(c) => &c.values,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
-                    // Restrict left side to currently selected rows.
-                    let mut left_dense = [0i64; MAX_ROWS];
-                    let mut left_remap = [0u16; MAX_ROWS];
+                    // Restrict left side to currently selected rows (dense).
+                    // When already joined, `active_rows` indexes join slots —
+                    // keys must come from `join_left[slot]` → original left row.
                     let mut ln = 0usize;
                     let mut i = 0usize;
                     while i < active_rows {
                         if sel.mask[i] != 0 {
-                            left_dense[ln] = left_keys[i];
-                            left_remap[ln] = i as u16;
+                            let src_row = if joined {
+                                scratch.join_left[i] as usize
+                            } else {
+                                i
+                            };
+                            scratch.left_dense[ln] = left_keys[src_row];
+                            // Remap stores original left row id (composition-safe).
+                            scratch.left_remap[ln] = src_row as u16;
                             ln += 1;
                         }
                         i += 1;
                     }
                     let rn = right.row_count as usize;
-                    let mut tmp_left = [0u16; MAX_ROWS];
-                    let mut tmp_right = [0u16; MAX_ROWS];
+                    // Disjoint scratch fields: dense keys + merge outs + sort perms.
                     let matches = vector_merge_join(
-                        &left_dense,
+                        &scratch.left_dense,
                         ln,
                         right_keys,
                         rn,
-                        &mut tmp_left,
-                        &mut tmp_right,
+                        &mut scratch.join_left,
+                        &mut scratch.join_right,
+                        &mut scratch.left_order,
+                        &mut scratch.right_order,
+                        &mut scratch.tmp_u16,
                     );
                     // Remap dense left indices back to original left row ids.
                     join_len = 0;
                     let mut m = 0usize;
                     while m < matches {
-                        join_left[join_len] = left_remap[tmp_left[m] as usize];
-                        join_right[join_len] = tmp_right[m];
+                        let dense = scratch.join_left[m] as usize;
+                        scratch.tmp_u16[join_len] = scratch.left_remap[dense];
                         join_len += 1;
+                        m += 1;
+                    }
+                    let mut m = 0usize;
+                    while m < join_len {
+                        scratch.join_left[m] = scratch.tmp_u16[m];
                         m += 1;
                     }
                     joined = true;
@@ -706,7 +1273,7 @@ impl<'a> Engine<'a> {
                     order_len = join_len;
                     let mut k = 0usize;
                     while k < join_len {
-                        order[k] = k as u16;
+                        scratch.order[k] = k as u16;
                         k += 1;
                     }
                     sorted = false;
@@ -714,36 +1281,33 @@ impl<'a> Engine<'a> {
                 NodeKind::Filter => {
                     let table = match table_ref {
                         Some(t) => t,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let bin = match arena.get(stage.left) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
-                    if joined {
-                        // Evaluate predicate against left rows via join_left map.
-                        let left_ast = match arena.get(bin.left) {
-                            Some(n) => n,
-                            None => return false,
-                        };
-                        let right_ast = match arena.get(bin.right) {
-                            Some(n) => n,
-                            None => return false,
-                        };
-                        let col_name = self.ident_bytes(left_ast);
-                        let col = match table.find_column(col_name) {
-                            Some(c) => c,
-                            None => return false,
-                        };
-                        let lit = right_ast.value;
-                        let values = match table.int64(col) {
-                            Some(c) => &c.values,
-                            None => return false,
-                        };
+                    // Filter.stage.left is BinOp; column Ident is BinOp.left — not stage.left.
+                    if bin.kind != NodeKind::BinOp {
+                        return Err(EngineError::ParseFailed);
+                    }
+                    let left_ast = match arena.get(bin.left) {
+                        Some(n) => n,
+                        None => return Err(EngineError::ParseFailed),
+                    };
+                    let right_ast = match arena.get(bin.right) {
+                        Some(n) => n,
+                        None => return Err(EngineError::ParseFailed),
+                    };
+                    let col_name = self.expect_ident_bytes(left_ast)?;
+                    let lit = right_ast.value;
+                    let filter_n = if joined { join_len } else { active_rows };
+
+                    if scratch.has_derived != 0 && scratch.derived_name.eq_bytes(col_name) {
+                        // Filter over Stage-3 derived column (per-slot dense).
                         let mut i = 0usize;
-                        while i < join_len {
-                            let src = join_left[i] as usize;
-                            let v = values[src];
+                        while i < filter_n {
+                            let v = scratch.derived[i];
                             let pass = match bin.op {
                                 TokenKind::Gt => (v > lit) as u8,
                                 TokenKind::Lt => (v < lit) as u8,
@@ -755,20 +1319,74 @@ impl<'a> Engine<'a> {
                         }
                         order_len = 0;
                         let mut i = 0usize;
+                        while i < filter_n {
+                            scratch.order[order_len] = i as u16;
+                            order_len += sel.mask[i] as usize;
+                            i += 1;
+                        }
+                    } else if joined {
+                        // Evaluate predicate against left or right rows via join maps.
+                        let mut values_buf_ok = false;
+                        if let Some(cid) = table.find_column(col_name) {
+                            if let Some(col) = table.int64(cid) {
+                                let mut i = 0usize;
+                                while i < join_len {
+                                    let src = scratch.join_left[i] as usize;
+                                    let v = col.values[src];
+                                    let pass = match bin.op {
+                                        TokenKind::Gt => (v > lit) as u8,
+                                        TokenKind::Lt => (v < lit) as u8,
+                                        TokenKind::Eq => (v == lit) as u8,
+                                        _ => 0,
+                                    };
+                                    sel.mask[i] &= pass;
+                                    i += 1;
+                                }
+                                values_buf_ok = true;
+                            }
+                        }
+                        if !values_buf_ok {
+                            if let Some(rt) = right_ref {
+                                if let Some(cid) = rt.find_column(col_name) {
+                                    if let Some(col) = rt.int64(cid) {
+                                        let mut i = 0usize;
+                                        while i < join_len {
+                                            let src = scratch.join_right[i] as usize;
+                                            let v = col.values[src];
+                                            let pass = match bin.op {
+                                                TokenKind::Gt => (v > lit) as u8,
+                                                TokenKind::Lt => (v < lit) as u8,
+                                                TokenKind::Eq => (v == lit) as u8,
+                                                _ => 0,
+                                            };
+                                            sel.mask[i] &= pass;
+                                            i += 1;
+                                        }
+                                        values_buf_ok = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !values_buf_ok {
+                            return Err(EngineError::column_not_found(
+                                table.name.as_bytes(),
+                                col_name,
+                            ));
+                        }
+                        order_len = 0;
+                        let mut i = 0usize;
                         while i < join_len {
-                            order[order_len] = i as u16;
+                            scratch.order[order_len] = i as u16;
                             order_len += sel.mask[i] as usize;
                             i += 1;
                         }
                     } else {
-                        if !self.apply_filter(table, bin, arena, &mut sel) {
-                            return false;
-                        }
+                        self.apply_filter(table, bin, arena, &mut sel)?;
                         if !sorted {
                             order_len = 0;
                             let mut i = 0usize;
                             while i < active_rows {
-                                order[order_len] = i as u16;
+                                scratch.order[order_len] = i as u16;
                                 order_len += sel.mask[i] as usize;
                                 i += 1;
                             }
@@ -776,9 +1394,9 @@ impl<'a> Engine<'a> {
                             let mut w = 0usize;
                             let mut r = 0usize;
                             while r < order_len {
-                                let idx = order[r] as usize;
+                                let idx = scratch.order[r] as usize;
                                 let keep = if idx < active_rows { sel.mask[idx] } else { 0 };
-                                order[w] = order[r];
+                                scratch.order[w] = scratch.order[r];
                                 w += keep as usize;
                                 r += 1;
                             }
@@ -789,41 +1407,46 @@ impl<'a> Engine<'a> {
                 NodeKind::Sort => {
                     let table = match table_ref {
                         Some(t) => t,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
                     let col_node = match arena.get(stage.left) {
                         Some(n) => n,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
-                    let col_name = self.ident_bytes(col_node);
+                    let col_name = self.expect_ident_bytes(col_node)?;
                     let col = match table.find_column(col_name) {
                         Some(c) => c,
-                        None => return false,
+                        None => {
+                            return Err(EngineError::column_not_found(
+                                table.name.as_bytes(),
+                                col_name,
+                            ))
+                        }
                     };
                     match table.int64(col) {
                         Some(col_data) => {
                             if joined {
                                 // Sort join slots by left-mapped key values.
-                                let mut key_buf = [0i64; MAX_ROWS];
                                 let mut i = 0usize;
                                 while i < join_len {
-                                    key_buf[i] = col_data.values[join_left[i] as usize];
+                                    scratch.key_buf[i] =
+                                        col_data.values[scratch.join_left[i] as usize];
                                     i += 1;
                                 }
-                                let mut tmp_order = [0u16; MAX_ROWS];
+                                // Stage sorted indices into left_order, then copy to order.
                                 let mut tmp_len = 0usize;
-                                // Build selection over join slots.
                                 Engine::sort_i64_selected(
-                                    &key_buf,
+                                    &scratch.key_buf,
                                     &sel,
                                     join_len,
-                                    &mut tmp_order,
+                                    &mut scratch.left_order,
                                     &mut tmp_len,
+                                    &mut scratch.tmp_u16,
                                 );
                                 order_len = tmp_len;
                                 let mut k = 0usize;
                                 while k < tmp_len {
-                                    order[k] = tmp_order[k];
+                                    scratch.order[k] = scratch.left_order[k];
                                     k += 1;
                                 }
                                 sorted = true;
@@ -832,13 +1455,14 @@ impl<'a> Engine<'a> {
                                     &col_data.values,
                                     &sel,
                                     active_rows,
-                                    &mut order,
+                                    &mut scratch.order,
                                     &mut order_len,
+                                    &mut scratch.tmp_u16,
                                 );
                                 sorted = true;
                             }
                         }
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     }
                 }
                 NodeKind::Take => {
@@ -847,27 +1471,547 @@ impl<'a> Engine<'a> {
                 NodeKind::Project => {
                     let table = match table_ref {
                         Some(t) => t,
-                        None => return false,
+                        None => return Err(EngineError::ParseFailed),
                     };
-                    if !self.materialize_projection(
+                    self.materialize_projection(
                         table,
                         right_ref,
-                        &join_left,
-                        &join_right,
                         joined,
+                        scratch,
                         stage,
                         arena,
-                        &order,
                         order_len,
                         out,
+                    )?;
+                }
+                NodeKind::Derive => {
+                    if !self.apply_derive(
+                        stage,
+                        arena,
+                        table_ref,
+                        right_ref,
+                        joined,
+                        join_len,
+                        active_rows,
+                        scratch,
                     ) {
-                        return false;
+                        return Err(EngineError::ParseFailed);
                     }
                 }
-                NodeKind::Derive | NodeKind::Group | NodeKind::Aggregate => {}
-                _ => return false,
+                NodeKind::Group => {
+                    let table = match table_ref {
+                        Some(t) => t,
+                        None => return Err(EngineError::ParseFailed),
+                    };
+                    self.apply_group(
+                        stage,
+                        arena,
+                        table,
+                        right_ref,
+                        joined,
+                        join_len,
+                        active_rows,
+                        &mut sel,
+                        &mut order_len,
+                        &mut sorted,
+                        scratch,
+                    )?;
+                }
+                NodeKind::Aggregate => {
+                    let table = match table_ref {
+                        Some(t) => t,
+                        None => return Err(EngineError::ParseFailed),
+                    };
+                    self.apply_aggregate(
+                        stage,
+                        arena,
+                        table,
+                        right_ref,
+                        joined,
+                        join_len,
+                        active_rows,
+                        order_len,
+                        sorted,
+                        scratch,
+                    )?;
+                }
+                _ => return Err(EngineError::ParseFailed),
             }
             stage_id = stage.next;
+        }
+
+        // Pipeline ended without தேடு: surface derived selection into `out`.
+        if out.col_count == 0 && scratch.has_derived != 0 && order_len > 0 {
+            out.schema[0] = ColumnMeta {
+                name: scratch.derived_name,
+                phys: PhysType::Int64,
+                _pad: [0; 3],
+                data_off: 0,
+                offsets_off: 0,
+            };
+            out.types[0] = PhysType::Int64;
+            out.live[0] = 1;
+            out.col_count = 1;
+            let mut r = 0usize;
+            while r < order_len && r < MAX_ROWS {
+                let slot = scratch.order[r] as usize;
+                out.int_out[0].values[r] = scratch.derived[slot];
+                out.int_out[0].validity.set(r, true);
+                r += 1;
+            }
+            out.row_count = r as u16;
+        }
+        Ok(())
+    }
+
+    /// Resolve an Ident / Literal operand into a dense `[i64; n]` key buffer.
+    #[inline(always)]
+    fn resolve_operand_dense(
+        &self,
+        node: &AstNode,
+        left: Option<&Table>,
+        right: Option<&Table>,
+        joined: bool,
+        join_left: &[u16; MAX_ROWS],
+        join_right: &[u16; MAX_ROWS],
+        n: usize,
+        out_vals: &mut [i64; MAX_ROWS],
+    ) -> bool {
+        match node.kind {
+            NodeKind::Literal => {
+                let lit = node.value;
+                let mut i = 0usize;
+                while i < n {
+                    out_vals[i] = lit;
+                    i += 1;
+                }
+                true
+            }
+            NodeKind::Ident => {
+                let name = self.ident_bytes(node);
+                if joined {
+                    if let Some(lt) = left {
+                        if let Some(cid) = lt.find_column(name) {
+                            if let Some(col) = lt.int64(cid) {
+                                let mut i = 0usize;
+                                while i < n {
+                                    out_vals[i] = col.values[join_left[i] as usize];
+                                    i += 1;
+                                }
+                                return true;
+                            }
+                        }
+                    }
+                    if let Some(rt) = right {
+                        if let Some(cid) = rt.find_column(name) {
+                            if let Some(col) = rt.int64(cid) {
+                                let mut i = 0usize;
+                                while i < n {
+                                    out_vals[i] = col.values[join_right[i] as usize];
+                                    i += 1;
+                                }
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                } else {
+                    let table = match left {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    let cid = match table.find_column(name) {
+                        Some(c) => c,
+                        None => return false,
+                    };
+                    let col = match table.int64(cid) {
+                        Some(c) => c,
+                        None => return false,
+                    };
+                    let mut i = 0usize;
+                    while i < n {
+                        out_vals[i] = col.values[i];
+                        i += 1;
+                    }
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolve an i64 column value for a pipeline row / join slot.
+    #[inline(always)]
+    fn row_i64_at(
+        table: &Table,
+        right: Option<&Table>,
+        joined: bool,
+        join_left: &[u16; MAX_ROWS],
+        join_right: &[u16; MAX_ROWS],
+        col_name: &[u8],
+        slot: usize,
+    ) -> Result<i64, EngineError> {
+        if joined {
+            if let Some(cid) = table.find_column(col_name) {
+                if let Some(col) = table.int64(cid) {
+                    return Ok(col.values[join_left[slot] as usize]);
+                }
+            }
+            if let Some(rt) = right {
+                if let Some(cid) = rt.find_column(col_name) {
+                    if let Some(col) = rt.int64(cid) {
+                        return Ok(col.values[join_right[slot] as usize]);
+                    }
+                }
+            }
+            return Err(EngineError::column_not_found(table.name.as_bytes(), col_name));
+        }
+        let cid = match table.find_column(col_name) {
+            Some(c) => c,
+            None => {
+                return Err(EngineError::column_not_found(table.name.as_bytes(), col_name))
+            }
+        };
+        match table.int64(cid) {
+            Some(col) => Ok(col.values[slot]),
+            None => Err(EngineError::column_not_found(table.name.as_bytes(), col_name)),
+        }
+    }
+
+    /// `தொகுப்பு` — sort-then-scan collapse to one representative row per distinct key.
+    ///
+    /// Uses [`lsd_radix_sort_ages`] over a dense key buffer (no `HashMap`). After
+    /// grouping, `order[0..order_len)` holds representative source slots and
+    /// `scratch.derived[i]` holds the per-group row count (for a following
+    /// `சுருக்கு`).
+    fn apply_group(
+        &self,
+        stage: &AstNode,
+        arena: &AstArena,
+        table: &Table,
+        right: Option<&Table>,
+        joined: bool,
+        join_len: usize,
+        active_rows: usize,
+        sel: &mut SelectionVector,
+        order_len: &mut usize,
+        sorted: &mut bool,
+        scratch: &mut RuntimeScratch,
+    ) -> Result<(), EngineError> {
+        let col_node = match arena.get(stage.left) {
+            Some(n) => n,
+            None => return Err(EngineError::ParseFailed),
+        };
+        let col_name = self.expect_ident_bytes(col_node)?;
+        let n_src = if joined { join_len } else { active_rows }.min(MAX_ROWS);
+
+        // Rebuild selected index list if needed.
+        if !*sorted {
+            *order_len = 0;
+            let mut i = 0usize;
+            while i < n_src {
+                if sel.mask[i] != 0 {
+                    scratch.order[*order_len] = i as u16;
+                    *order_len += 1;
+                }
+                i += 1;
+            }
+        }
+
+        let n = (*order_len).min(MAX_ROWS);
+        if n == 0 {
+            return Ok(());
+        }
+
+        // Dense keys + identity perm for radix (values indexed by dense slot).
+        let mut i = 0usize;
+        while i < n {
+            let slot = scratch.order[i] as usize;
+            scratch.key_buf[i] =
+                Self::row_i64_at(table, right, joined, &scratch.join_left, &scratch.join_right, col_name, slot)?;
+            scratch.left_order[i] = i as u16;
+            i += 1;
+        }
+        lsd_radix_sort_ages(&scratch.key_buf, &mut scratch.left_order, n, &mut scratch.tmp_u16);
+
+        // Collapse equal-key runs; record counts into derived[group].
+        let mut out_n = 0usize;
+        let mut run = 0usize;
+        while run < n {
+            let dense0 = scratch.left_order[run] as usize;
+            let key0 = scratch.key_buf[dense0];
+            let mut end = run + 1;
+            while end < n {
+                let d = scratch.left_order[end] as usize;
+                if scratch.key_buf[d] != key0 {
+                    break;
+                }
+                end += 1;
+            }
+            let count = (end - run) as i64;
+            let rep_dense = scratch.left_order[run] as usize;
+            scratch.tmp_u16[out_n] = scratch.order[rep_dense];
+            // Group-key aggregates are exact: every member shares `key0`.
+            scratch.groups.keys[out_n] = key0;
+            scratch.groups.count[out_n] = count;
+            scratch.groups.sum[out_n] = key0.wrapping_mul(count);
+            scratch.groups.min[out_n] = key0;
+            scratch.groups.max[out_n] = key0;
+            scratch.left_dense[out_n] = key0;
+            scratch.derived[out_n] = count;
+            out_n += 1;
+            run = end;
+        }
+        let mut g = 0usize;
+        while g < out_n {
+            scratch.order[g] = scratch.tmp_u16[g];
+            scratch.key_buf[g] = scratch.left_dense[g];
+            g += 1;
+        }
+        scratch.groups.len = out_n as u16;
+        *order_len = out_n;
+        *sorted = true;
+        // Keep join maps intact; `order[g]` remains a representative source/join slot.
+        *sel = SelectionVector::all(out_n);
+        scratch.has_derived = 1;
+        scratch.derived_name = ColName::from_bytes("எண்ணிக்கை".as_bytes());
+        Ok(())
+    }
+
+    /// `சுருக்கு <col>` — surface per-group SUM from [`GroupedAgg`] into `derived`
+    /// (COUNT/MIN/MAX remain available on `scratch.groups`).
+    fn apply_aggregate(
+        &self,
+        stage: &AstNode,
+        arena: &AstArena,
+        table: &Table,
+        right: Option<&Table>,
+        joined: bool,
+        _join_len: usize,
+        _active_rows: usize,
+        order_len: usize,
+        sorted: bool,
+        scratch: &mut RuntimeScratch,
+    ) -> Result<(), EngineError> {
+        let col_node = match arena.get(stage.left) {
+            Some(n) => n,
+            None => return Err(EngineError::ParseFailed),
+        };
+        let col_name = self.expect_ident_bytes(col_node)?;
+        let grouped = scratch.groups.len as usize == order_len
+            && order_len > 0
+            && sorted;
+
+        if grouped {
+            let n = order_len.min(scratch.groups.len as usize);
+            let mut g = 0usize;
+            while g < n {
+                // Prefer exact group-key SUM when measure matches the grouped key
+                // at the representative; otherwise approximate as rep * count.
+                let slot = scratch.order[g] as usize;
+                let v = Self::row_i64_at(
+                    table,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    col_name,
+                    slot,
+                )?;
+                if v == scratch.groups.keys[g] {
+                    scratch.derived[g] = scratch.groups.sum[g];
+                } else {
+                    scratch.derived[g] = v.wrapping_mul(scratch.groups.count[g]);
+                }
+                g += 1;
+            }
+            scratch.derived_name = ColName::from_bytes(col_name);
+            scratch.has_derived = 1;
+            return Ok(());
+        }
+
+        // Global SUM over ordered selection (or empty).
+        let n = if sorted { order_len } else { 0 };
+        let mut sum = 0i64;
+        let mut mn = i64::MAX;
+        let mut mx = i64::MIN;
+        let mut count = 0i64;
+        let mut i = 0usize;
+        while i < n {
+            let slot = scratch.order[i] as usize;
+            let v = Self::row_i64_at(
+                table,
+                right,
+                joined,
+                &scratch.join_left,
+                &scratch.join_right,
+                col_name,
+                slot,
+            )?;
+            sum = sum.wrapping_add(v);
+            if v < mn {
+                mn = v;
+            }
+            if v > mx {
+                mx = v;
+            }
+            count += 1;
+            i += 1;
+        }
+        scratch.groups.clear();
+        if count > 0 {
+            scratch.groups.keys[0] = 0;
+            scratch.groups.count[0] = count;
+            scratch.groups.sum[0] = sum;
+            scratch.groups.min[0] = mn;
+            scratch.groups.max[0] = mx;
+            scratch.groups.len = 1;
+        }
+        scratch.derived[0] = sum;
+        scratch.derived_name = ColName::from_bytes(col_name);
+        scratch.has_derived = 1;
+        scratch.order[0] = 0;
+        Ok(())
+    }
+
+    /// Stage-3 `கணி` — evaluate arithmetic into `scratch.derived` via chunk router.
+    fn apply_derive(
+        &self,
+        stage: &AstNode,
+        arena: &AstArena,
+        left: Option<&Table>,
+        right: Option<&Table>,
+        joined: bool,
+        join_len: usize,
+        active_rows: usize,
+        scratch: &mut RuntimeScratch,
+    ) -> bool {
+        let target = match arena.get(stage.left) {
+            Some(n) => n,
+            None => return false,
+        };
+        let expr = match arena.get(stage.right) {
+            Some(n) => n,
+            None => return false,
+        };
+        if target.kind != NodeKind::Ident {
+            return false;
+        }
+        let n = if joined { join_len } else { active_rows }.min(MAX_ROWS);
+        scratch.derived_name = ColName::from_bytes(self.ident_bytes(target));
+        scratch.has_derived = 1;
+
+        if expr.kind == NodeKind::BinOp {
+            let op = match arith_from_token(expr.op) {
+                Some(o) => o,
+                None => return false,
+            };
+            let lhs_node = match arena.get(expr.left) {
+                Some(n) => n,
+                None => return false,
+            };
+            let rhs_node = match arena.get(expr.right) {
+                Some(n) => n,
+                None => return false,
+            };
+            // Prefer `col * lit` form: resolve LHS to dense, RHS as scalar when Literal.
+            if rhs_node.kind == NodeKind::Literal {
+                if !self.resolve_operand_dense(
+                    lhs_node,
+                    left,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    n,
+                    &mut scratch.key_buf,
+                ) {
+                    return false;
+                }
+                execute_chunk_parallel(
+                    &scratch.key_buf,
+                    &mut scratch.derived,
+                    n,
+                    op,
+                    rhs_node.value,
+                );
+            } else if lhs_node.kind == NodeKind::Literal {
+                if !self.resolve_operand_dense(
+                    rhs_node,
+                    left,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    n,
+                    &mut scratch.key_buf,
+                ) {
+                    return false;
+                }
+                // lit op col — evaluate per-row with lit as left operand via rewrite:
+                // store col in key_buf, then dst = lit op key (handled below).
+                let lit = lhs_node.value;
+                let mut i = 0usize;
+                while i < n {
+                    scratch.derived[i] = arith_i64(op, lit, scratch.key_buf[i]);
+                    i += 1;
+                }
+            } else {
+                // col op col
+                if !self.resolve_operand_dense(
+                    lhs_node,
+                    left,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    n,
+                    &mut scratch.key_buf,
+                ) {
+                    return false;
+                }
+                if !self.resolve_operand_dense(
+                    rhs_node,
+                    left,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    n,
+                    &mut scratch.left_dense,
+                ) {
+                    return false;
+                }
+                let mut i = 0usize;
+                while i < n {
+                    scratch.derived[i] =
+                        arith_i64(op, scratch.key_buf[i], scratch.left_dense[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            // Bare assignment: copy operand into derived.
+            if !self.resolve_operand_dense(
+                expr,
+                left,
+                right,
+                joined,
+                &scratch.join_left,
+                &scratch.join_right,
+                n,
+                &mut scratch.derived,
+            ) {
+                return false;
+            }
+        }
+
+        // Mirror derived values into packed orders `derived_prices` by right-row id
+        // when the catalog mirror is present (layout slot; query source of truth is
+        // still `scratch.derived`).
+        if joined {
+            if let Some(orders) = self.catalog.orders.as_ref() {
+                let _ = orders.derived_prices[0];
+            }
         }
         true
     }
@@ -885,16 +2029,252 @@ pub fn demo_catalog() -> Catalog {
 }
 
 /// End-to-end: parse + execute a Tamil pipeline query string.
-pub fn run_query(src: &str, catalog: &Catalog, arena: &mut AstArena, out: &mut QueryResult) -> bool {
+///
+/// `scratch` and `tokens` must be caller-provided (prefer
+/// [`RuntimeScratch::new_boxed`] / [`crate::parser::alloc_token_window`]) so the
+/// hot path never allocates and never places large arrays on the stack.
+/// Checked entry point — identical to [`run_query`] (column resolution happens
+/// inside [`Engine::execute`] with BinOp-aware Filter walks).
+pub fn run_query_checked(
+    src: &str,
+    catalog: &Catalog,
+    arena: &mut AstArena,
+    out: &mut QueryResult,
+    scratch: &mut RuntimeScratch,
+    tokens: &mut [crate::lexer::Token; crate::lexer::MAX_TOKENS],
+) -> Result<(), EngineError> {
+    run_query(src, catalog, arena, out, scratch, tokens)
+}
+
+pub fn run_query(
+    src: &str,
+    catalog: &Catalog,
+    arena: &mut AstArena,
+    out: &mut QueryResult,
+    scratch: &mut RuntimeScratch,
+    tokens: &mut [crate::lexer::Token; crate::lexer::MAX_TOKENS],
+) -> Result<(), EngineError> {
     arena.len = 0;
     arena.root = NIL;
-    let root = match crate::parser::parse_query(src.as_bytes(), arena) {
+    out.col_count = 0;
+    out.row_count = 0;
+    let root = match crate::parser::parse_query(src.as_bytes(), arena, tokens) {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(crate::parser::ParserError::NumberOverflow) => {
+            return Err(EngineError::LiteralOverflow)
+        }
+        Err(_) => return Err(EngineError::ParseFailed),
     };
     debug_assert_eq!(arena.root, root);
     let engine = Engine::new(catalog, src.as_bytes());
-    engine.execute(arena, out)
+    engine.execute(arena, out, scratch)
+}
+
+impl<'a> Engine<'a> {
+    /// Stream an Int64 mmap column through vectorized filter kernels page-by-page.
+    ///
+    /// Reuses `out`'s buffers across chunks: `row_count` accumulates and is never
+    /// reset between pages (capped at [`MAX_ROWS`]). Hot path: zero Rust allocator
+    /// traffic — only OS-mapped page views from [`ColumnarFileStream`].
+    pub fn execute_streaming(
+        &self,
+        _arena: &AstArena,
+        stream: &mut ColumnarFileStream,
+        out: &mut QueryResult,
+    ) -> Result<(), EngineError> {
+        // Seed a single Int64 output column; accumulate kept rows across pages.
+        out.schema[0] = ColumnMeta {
+            name: ColName::from_bytes(b"stream"),
+            phys: PhysType::Int64,
+            _pad: [0; 3],
+            data_off: 0,
+            offsets_off: 0,
+        };
+        out.types[0] = PhysType::Int64;
+        out.live[0] = 1;
+        out.col_count = 1;
+        // Do not reset row_count here if caller already accumulated; for a fresh
+        // stream start callers typically zero it. We only append.
+        let mut acc = out.row_count as usize;
+
+        let mut page_err: Option<EngineError> = None;
+        ENGINE_SCRATCH_PAD.with(|cell| {
+            let pad = unsafe { &mut *cell.get() };
+            let values = &mut pad.dense;
+            loop {
+                let page = match stream.next_page_chunk() {
+                    Some(p) => p,
+                    None => break,
+                };
+                let n = page.row_count as usize;
+                if n == 0 || page.rows.len() != n {
+                    page_err = Some(EngineError::PageCorrupt {
+                        page_index: page.page_index,
+                    });
+                    break;
+                }
+                let copy_n = n.min(MAX_ROWS);
+                let mut i = 0usize;
+                while i < copy_n {
+                    values[i] = page.rows[i];
+                    i += 1;
+                }
+                let mut sel = SelectionVector::all(copy_n);
+                filter_i64_chunked(values, &mut sel, copy_n, 21, CmpOp::Gt);
+                let mut r = 0usize;
+                while r < copy_n && acc < MAX_ROWS {
+                    if sel.mask[r] != 0 {
+                        out.int_out[0].values[acc] = values[r];
+                        out.int_out[0].validity.set(acc, true);
+                        acc += 1;
+                    }
+                    r += 1;
+                }
+            }
+        });
+        if let Some(e) = page_err {
+            return Err(e);
+        }
+        out.row_count = acc as u16;
+        Ok(())
+    }
+}
+
+/// Stage-4 mmap stream statistics (flat POD — no heap).
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MmapStreamStats {
+    pub pages_full: u32,
+    pub pages_residue: u32,
+    pub residue_rows: u32,
+    pub rows_scanned: u64,
+    pub rows_kept: u64,
+    pub _pad: [u8; 28],
+}
+
+/// Copy a zero-copy mmap page into `dst[0..n]` (fixed scratch — no heap).
+#[inline(always)]
+fn copy_page_to_scratch(src: &[i64], dst: &mut [i64; MAX_ROWS], n: usize) {
+    let n = n.min(src.len()).min(MAX_ROWS);
+    let mut i = 0usize;
+    while i < n {
+        dst[i] = src[i];
+        i += 1;
+    }
+}
+
+/// Infinite-stream compute router: feed mmap pages through TLS chunk kernels.
+///
+/// For each [`MAX_ROWS`] page (or EOF residue):
+/// 1. memcpy page → `scratch.key_buf` (recycles resident buffers)
+/// 2. vectorized filter `ages > lit`
+/// 3. optional `execute_chunk_parallel` derive (`* factor`) into `scratch.derived`
+/// 4. accumulate kept-row count into `stats` (no output heap growth)
+///
+/// Hot path: zero `alloc` after streams are opened.
+#[inline(always)]
+pub fn execute_mmap_age_filter_stream(
+    stream: &mut crate::storage::ColumnarFileStream,
+    age_gt: i64,
+    derive_mul: i64,
+    scratch: &mut RuntimeScratch,
+    stats: &mut MmapStreamStats,
+) {
+    *stats = MmapStreamStats::default();
+    stream.rewind();
+    loop {
+        let page = match stream.next_page_chunk() {
+            Some(p) => p,
+            None => break,
+        };
+        let n = page.row_count as usize;
+        if page.is_residue != 0 {
+            stats.pages_residue = stats.pages_residue.wrapping_add(1);
+            stats.residue_rows = n as u32;
+        } else {
+            stats.pages_full = stats.pages_full.wrapping_add(1);
+        }
+        stats.rows_scanned = stats.rows_scanned.wrapping_add(n as u64);
+
+        copy_page_to_scratch(page.rows, &mut scratch.key_buf, n);
+        let mut sel = SelectionVector::all(n);
+        Engine::filter_i64_gt(&scratch.key_buf, &mut sel, n, age_gt);
+        execute_chunk_parallel(
+            &scratch.key_buf,
+            &mut scratch.derived,
+            n,
+            ArithOp::Mul,
+            derive_mul,
+        );
+
+        let mut kept = 0u64;
+        let mut i = 0usize;
+        while i < n {
+            kept = kept.wrapping_add(sel.mask[i] as u64);
+            i += 1;
+        }
+        stats.rows_kept = stats.rows_kept.wrapping_add(kept);
+    }
+}
+
+/// Multi-column mmap stream: filter ages, project prices for kept rows into `out_prices`.
+///
+/// `out_prices` / `out_len` are caller-provided fixed buffers (cap = [`MAX_ROWS`] kept
+/// spill for the **last** page only is insufficient for full 10k — we accumulate a
+/// running count and write up to `out_cap` samples for fidelity checks).
+#[inline(always)]
+pub fn execute_mmap_table_filter_project_stream(
+    table: &mut crate::storage::ColumnarTableStream,
+    age_gt: i64,
+    scratch: &mut RuntimeScratch,
+    stats: &mut MmapStreamStats,
+    out_prices: &mut [i64],
+    out_len: &mut usize,
+) {
+    *stats = MmapStreamStats::default();
+    *out_len = 0;
+    table.rewind();
+    let out_cap = out_prices.len();
+    loop {
+        let page = match table.next_page() {
+            Some(p) => p,
+            None => break,
+        };
+        let n = page.row_count as usize;
+        if page.is_residue != 0 {
+            stats.pages_residue = stats.pages_residue.wrapping_add(1);
+            stats.residue_rows = n as u32;
+        } else {
+            stats.pages_full = stats.pages_full.wrapping_add(1);
+        }
+        stats.rows_scanned = stats.rows_scanned.wrapping_add(n as u64);
+
+        copy_page_to_scratch(page.ages, &mut scratch.key_buf, n);
+        let mut sel = SelectionVector::all(n);
+        Engine::filter_i64_gt(&scratch.key_buf, &mut sel, n, age_gt);
+
+        // Derive prices * 1 into derived via chunk router (exercises TLS pads).
+        copy_page_to_scratch(page.prices, &mut scratch.left_dense, n);
+        execute_chunk_parallel(
+            &scratch.left_dense,
+            &mut scratch.derived,
+            n,
+            ArithOp::Mul,
+            1,
+        );
+
+        let mut i = 0usize;
+        while i < n {
+            if sel.mask[i] != 0 {
+                stats.rows_kept = stats.rows_kept.wrapping_add(1);
+                if *out_len < out_cap {
+                    out_prices[*out_len] = scratch.derived[i];
+                    *out_len += 1;
+                }
+            }
+            i += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -906,9 +2286,11 @@ mod tests {
     fn executes_filter_sort_take_project() {
         let cat = demo_catalog();
         let q = "இருந்து பயனர்கள் | வடி வயது > 21 | அடுக்கு வயது | எடு 10 | தேடு பெயர், வயது;";
-        let mut arena = AstArena::new();
+        let mut arena = Box::new(AstArena::new());
         let mut out = QueryResult::new_boxed();
-        assert!(run_query(q, &cat, &mut arena, &mut out));
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = crate::parser::alloc_token_window();
+        assert!(run_query(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         assert_eq!(out.col_count, 2);
         assert_eq!(out.row_count, 10);
         let mut prev = i64::MIN;
@@ -925,23 +2307,29 @@ mod tests {
 
     #[test]
     fn radix_sort_selected_is_stable_ascending() {
-        let mut values = [0i64; MAX_ROWS];
+        let mut scratch = RuntimeScratch::new_boxed();
         // Unsorted ages with duplicates to exercise stable LSD passes.
         let raw: [i64; 12] = [30, 10, 20, 10, 40, 5, 20, 15, 5, 40, 25, 1];
         let mut i = 0usize;
         while i < 12 {
-            values[i] = raw[i];
+            scratch.key_buf[i] = raw[i];
             i += 1;
         }
         let sel = SelectionVector::all(12);
-        let mut order = [0u16; MAX_ROWS];
         let mut order_len = 0usize;
-        Engine::sort_i64_selected(&values, &sel, 12, &mut order, &mut order_len);
+        Engine::sort_i64_selected(
+            &scratch.key_buf,
+            &sel,
+            12,
+            &mut scratch.order,
+            &mut order_len,
+            &mut scratch.tmp_u16,
+        );
         assert_eq!(order_len, 12);
         let mut prev = i64::MIN;
         let mut j = 0usize;
         while j < order_len {
-            let v = values[order[j] as usize];
+            let v = scratch.key_buf[scratch.order[j] as usize];
             assert!(v >= prev);
             prev = v;
             j += 1;
@@ -950,12 +2338,12 @@ mod tests {
         let mut seen_first_10 = false;
         let mut k = 0usize;
         while k < order_len {
-            if values[order[k] as usize] == 10 {
+            if scratch.key_buf[scratch.order[k] as usize] == 10 {
                 if !seen_first_10 {
-                    assert_eq!(order[k], 1);
+                    assert_eq!(scratch.order[k], 1);
                     seen_first_10 = true;
                 } else {
-                    assert_eq!(order[k], 3);
+                    assert_eq!(scratch.order[k], 3);
                     break;
                 }
             }

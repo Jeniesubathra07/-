@@ -71,6 +71,12 @@ pub enum TokenKind {
     Eof = 18,
     /// Lexical error sentinel
     Error = 19,
+    /// `*` — multiply (derive math)
+    Star = 20,
+    /// `+` — add (derive math)
+    Plus = 21,
+    /// `-` — subtract (derive math)
+    Minus = 22,
 }
 
 impl TokenKind {
@@ -141,6 +147,9 @@ const OP_KIND_LUT: [u8; 256] = {
     t[b'<' as usize] = TokenKind::Lt as u8;
     t[b',' as usize] = TokenKind::Comma as u8;
     t[b';' as usize] = TokenKind::Semi as u8;
+    t[b'*' as usize] = TokenKind::Star as u8;
+    t[b'+' as usize] = TokenKind::Plus as u8;
+    t[b'-' as usize] = TokenKind::Minus as u8;
     t
 };
 
@@ -278,22 +287,34 @@ impl<'a> Lexer<'a> {
         self.pos = i;
     }
 
-    /// Branchless decimal accumulate: `val = val * 10 + (byte - b'0')`.
+    /// Branchless decimal accumulate with overflow detection.
+    ///
+    /// On overflow, `number` is set to [`i64::MIN`] as a sentinel rejected by
+    /// [`crate::parser::Parser::expect_number`]. `i64::MIN` itself is therefore
+    /// not representable as a query literal (acceptable for this DSL).
     #[inline(always)]
     fn scan_number(&mut self) -> Token {
         let start = self.pos as u32;
         let bytes = self.src;
         let mut i = self.pos;
         let mut val: i64 = 0;
+        let mut overflow = false;
         while i < bytes.len() {
             let b = bytes[i];
             let is_digit = IS_DIGIT_LUT[b as usize];
             if is_digit == 0 {
                 break;
             }
-            val = val
-                .wrapping_mul(10)
-                .wrapping_add((b.wrapping_sub(b'0')) as i64);
+            let digit = (b.wrapping_sub(b'0')) as i64;
+            if !overflow {
+                match val.checked_mul(10).and_then(|v| v.checked_add(digit)) {
+                    Some(v) => val = v,
+                    None => {
+                        overflow = true;
+                        val = i64::MIN;
+                    }
+                }
+            }
             i += 1;
         }
         self.pos = i;
@@ -319,6 +340,9 @@ impl<'a> Lexer<'a> {
             x if x == TokenKind::Lt as u8 => TokenKind::Lt,
             x if x == TokenKind::Comma as u8 => TokenKind::Comma,
             x if x == TokenKind::Semi as u8 => TokenKind::Semi,
+            x if x == TokenKind::Star as u8 => TokenKind::Star,
+            x if x == TokenKind::Plus as u8 => TokenKind::Plus,
+            x if x == TokenKind::Minus as u8 => TokenKind::Minus,
             _ => TokenKind::Error,
         };
         Token {
@@ -439,7 +463,15 @@ mod tests {
     fn lexes_pipeline_keywords() {
         let q = "இருந்து பயனர்கள் | வடி வயது > 21 | அடுக்கு வயது | எடு 10 | தேடு பெயர், வயது;";
         let mut lex = Lexer::new(q.as_bytes());
-        let mut buf = [Token::eof(); MAX_TOKENS];
+        let mut buf = {
+            use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+            unsafe {
+                let layout = Layout::new::<[Token; MAX_TOKENS]>();
+                let ptr = alloc_zeroed(layout) as *mut [Token; MAX_TOKENS];
+                if ptr.is_null() { handle_alloc_error(layout); }
+                Box::from_raw(ptr)
+            }
+        };
         let n = lex.tokenize_into(&mut buf).expect("tokenize");
         assert!(n > 10);
         assert_eq!(buf[0].kind, TokenKind::Irundu);
