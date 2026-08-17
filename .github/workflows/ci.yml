@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stable:
+    name: stable build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stable-
+      - name: Build release
+        run: cargo build --release
+      - name: Test release
+        run: cargo test --release
+
+  miri:
+    name: nightly miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Cache cargo (miri)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-miri-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-miri-
+      - name: Miri test
+        # File-backed mmap tests are ignored under Miri via cfg_attr.
+        run: cargo +nightly miri test
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+
+  fuzz-smoke:
+    name: audit_fuzz_driver smoke
+    runs-on: ubuntu-latest
+    # Gate on pushes to main (and PRs targeting main) so every mainline
+    # integration gets a ~5 minute pure-Rust mutation fuzz pass.
+    if: github.ref == 'refs/heads/main' || github.base_ref == 'main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo (fuzz)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-
+      - name: Run audit_fuzz_driver (300 iters ≈ smoke gate)
+        run: cargo run --release --bin audit_fuzz_driver -- 300

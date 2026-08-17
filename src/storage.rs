@@ -732,6 +732,57 @@ pub fn seed_orders_table() -> Box<Table> {
     t
 }
 
+/// Orders fixture with intentional duplicate `விலை` buckets for multi-row GroupedAgg.
+///
+/// Hand-computed groups after `தொகுப்பு விலை` (sorted by key):
+/// - 100 × 3 → count=3, sum=300, min=100, max=100
+/// - 250 × 4 → count=4, sum=1000, min=250, max=250
+/// - 500 × 1 → count=1, sum=500, min=500, max=500
+pub fn seed_dup_price_orders_table() -> Box<Table> {
+    let mut t = Table::new_boxed("ஆர்டர்கள்".as_bytes());
+    let uid = t.add_int64_column("அடையாளம்".as_bytes()).unwrap();
+    let price = t.add_int64_column("விலை".as_bytes()).unwrap();
+    // (user_id, price) — three 100s, four 250s, one 500.
+    let pairs: [(i64, i64); 8] = [
+        (1, 100),
+        (2, 250),
+        (3, 100),
+        (4, 250),
+        (5, 100),
+        (6, 250),
+        (7, 500),
+        (8, 250),
+    ];
+    let n = pairs.len();
+    {
+        let c = t.int64_mut(uid).unwrap();
+        let mut i = 0usize;
+        while i < n {
+            c.values[i] = pairs[i].0;
+            c.validity.set(i, true);
+            i += 1;
+        }
+    }
+    {
+        let c = t.int64_mut(price).unwrap();
+        let mut i = 0usize;
+        while i < n {
+            c.values[i] = pairs[i].1;
+            c.validity.set(i, true);
+            i += 1;
+        }
+    }
+    t.set_row_count(n);
+    t
+}
+
+/// Catalog with only the duplicate-price orders relation (no users join needed).
+pub fn dup_price_orders_catalog() -> Catalog {
+    let mut cat = Catalog::new();
+    let _ = cat.register_box(seed_dup_price_orders_table());
+    cat
+}
+
 /// Raw byte copy helper that never allocates.
 ///
 /// # Safety
@@ -833,6 +884,10 @@ impl Utf8ColumnFile {
     /// Both mappings are READ-ONLY single-writer-absent snapshots. Truncating,
     /// deleting, or replacing either file while this value is live can deliver
     /// `SIGBUS` on the next access — not a Rust `Result::Err`.
+    ///
+    /// Int64 callers who need crash-proof guarantees should use
+    /// [`ColumnarFileStream::open_int64_copied`]; Utf8 has no copy-on-open yet
+    /// (document as [DOCUMENTED-LIMIT] — same SIGBUS contract).
     pub fn open(offsets_path: &Path, blob_path: &Path, meta_path: Option<&Path>) -> io::Result<Self> {
         let off_file = File::open(offsets_path)?;
         let blob_file = File::open(blob_path)?;
@@ -845,7 +900,9 @@ impl Utf8ColumnFile {
             ));
         }
         let capacity_rows = off_len / entry_size;
-        // SAFETY: read-only files; lengths validated.
+        // SAFETY: files opened read-only; `.offsets` length is a multiple of the
+        // entry size. Mapping validity requires the single-writer-absent contract
+        // (else SIGBUS). Bounds for each `get_row` are checked at use sites.
         let offsets_mmap = unsafe { Mmap::map(&off_file)? };
         let blob_mmap = unsafe { Mmap::map(&blob_file)? };
         let blob_len = blob_mmap.len() as u64;
@@ -1010,7 +1067,46 @@ impl<'a> ColumnarChunk<'a> {
     }
 }
 
-/// Zero-copy Int64 columnar file stream via OS virtual memory map.
+/// Backing store for a columnar Int64 stream.
+///
+/// - [`ColumnBytes::Mmap`]: zero-copy; subject to SIGBUS if the file is mutated.
+/// - [`ColumnBytes::Owned`]: crash-proof copy-on-open; immune to later truncation.
+pub(crate) enum ColumnBytes {
+    Mmap(Mmap),
+    /// Little-endian i64 values copied from disk (naturally 8-byte aligned).
+    Owned(Vec<i64>),
+}
+
+impl ColumnBytes {
+    #[inline(always)]
+    fn byte_len(&self) -> usize {
+        match self {
+            ColumnBytes::Mmap(m) => m.len(),
+            ColumnBytes::Owned(v) => v.len().wrapping_mul(8),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_owned(&self) -> bool {
+        matches!(self, ColumnBytes::Owned(_))
+    }
+
+    /// Borrow `n` i64 values starting at row `start` (bounds must be pre-checked).
+    #[inline(always)]
+    unsafe fn rows_at(&self, start: usize, n: usize) -> &[i64] {
+        match self {
+            ColumnBytes::Mmap(m) => {
+                let byte_off = start.wrapping_mul(8);
+                let byte_end = byte_off.wrapping_add(n.wrapping_mul(8));
+                let bytes = &m[byte_off..byte_end];
+                core::slice::from_raw_parts(bytes.as_ptr() as *const i64, n)
+            }
+            ColumnBytes::Owned(v) => &v[start..start + n],
+        }
+    }
+}
+
+/// Int64 columnar file stream (mmap zero-copy **or** owned copy-on-open).
 ///
 /// # Page derivation
 /// `page_rows = os_page_size_bytes() / row_width` for fixed-width columns
@@ -1018,10 +1114,10 @@ impl<'a> ColumnarChunk<'a> {
 /// `sysconf(_SC_PAGESIZE)`, not a hardcoded row count such as 4096.
 ///
 /// Cold path: `open` / ingest. Hot path: [`ColumnarFileStream::next_page_chunk`]
-/// returns a borrowed slice over the mmap (lifetime tied to `&self` / `&mut self`).
+/// returns a borrowed slice over the backing bytes (lifetime tied to `&mut self`).
 pub struct ColumnarFileStream {
-    /// Owns the OS mapping for this column's lifetime.
-    pub(crate) mmap: Mmap,
+    /// Owns either an OS mmap or a heap copy of the column bytes.
+    pub(crate) bytes: ColumnBytes,
     pub row_width: usize,
     /// `= sysconf(_SC_PAGESIZE) / row_width`.
     pub page_rows: usize,
@@ -1037,6 +1133,9 @@ impl ColumnarFileStream {
     /// snapshot**: the backing file must not be truncated, deleted, or replaced
     /// for the lifetime of this stream. Violating that precondition can deliver
     /// `SIGBUS` on access — a process-level signal, **not** a Rust `Result::Err`.
+    ///
+    /// Callers who need crash-proof reads under hostile writers should use
+    /// [`ColumnarFileStream::open_int64_copied`] instead (heap copy; no SIGBUS).
     pub fn open_i64(path: &Path) -> io::Result<Self> {
         let meta_path = path.with_extension("meta");
         let meta = match File::open(&meta_path) {
@@ -1051,7 +1150,33 @@ impl ColumnarFileStream {
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        Self::open_i64_inner(path, meta)
+        Self::open_i64_inner(path, meta, false)
+    }
+
+    /// Crash-proof cold-path open: read the entire `.bin` into a heap `Vec`
+    /// instead of mmap'ing it.
+    ///
+    /// After open completes, truncating/deleting the backing file cannot
+    /// `SIGBUS` this process — the bytes live in owned memory. Tradeoff: cold
+    /// open allocates `file_len` bytes and copies once; hot page walks are then
+    /// ordinary loads (same `next_page_chunk` API). Prefer mmap
+    /// ([`ColumnarFileStream::open_i64`]) when the snapshot contract holds and
+    /// zero-copy latency matters.
+    pub fn open_int64_copied(path: &Path) -> io::Result<Self> {
+        let meta_path = path.with_extension("meta");
+        let meta = match File::open(&meta_path) {
+            Ok(mut f) => {
+                let mut buf = [0u8; 8];
+                use std::io::Read;
+                f.read_exact(&mut buf)?;
+                Some(Int64ColumnMeta {
+                    row_count: u64::from_le_bytes(buf),
+                })
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        Self::open_i64_inner(path, meta, true)
     }
 
     /// Cold-path open with explicit `.meta` validation (row_count must match).
@@ -1061,10 +1186,16 @@ impl ColumnarFileStream {
     /// for the lifetime of the returned mapping.
     pub fn open_i64_with_meta(bin_path: &Path, meta_path: &Path) -> io::Result<Self> {
         let meta = read_int64_meta(meta_path)?;
-        Self::open_i64_inner(bin_path, Some(meta))
+        Self::open_i64_inner(bin_path, Some(meta), false)
     }
 
-    fn open_i64_inner(path: &Path, meta: Option<Int64ColumnMeta>) -> io::Result<Self> {
+    /// Crash-proof variant of [`ColumnarFileStream::open_i64_with_meta`].
+    pub fn open_int64_copied_with_meta(bin_path: &Path, meta_path: &Path) -> io::Result<Self> {
+        let meta = read_int64_meta(meta_path)?;
+        Self::open_i64_inner(bin_path, Some(meta), true)
+    }
+
+    fn open_i64_inner(path: &Path, meta: Option<Int64ColumnMeta>, copy: bool) -> io::Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
         let row_width = core::mem::size_of::<i64>();
@@ -1074,8 +1205,23 @@ impl ColumnarFileStream {
                 "i64 column file length not multiple of 8",
             ));
         }
-        // SAFETY: file is opened read-only; length validated.
-        let mmap = unsafe { Mmap::map(&file)? };
+        let bytes = if copy {
+            use std::io::Read;
+            let n_vals = len / row_width;
+            let mut vals = vec![0i64; n_vals];
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(vals.as_mut_ptr() as *mut u8, len)
+            };
+            let mut f = file;
+            f.read_exact(dst)?;
+            ColumnBytes::Owned(vals)
+        } else {
+            // SAFETY: file opened read-only; `len` validated as multiple of 8.
+            // Mapping remains valid for this process only while the single-
+            // writer-absent snapshot contract holds (else SIGBUS — see docs).
+            let mmap = unsafe { Mmap::map(&file)? };
+            ColumnBytes::Mmap(mmap)
+        };
         // Logical row count from payload bytes (ignore page-alignment padding
         // beyond the last full i64 when a `.meta` row_count is present).
         let file_rows = len / row_width;
@@ -1098,7 +1244,7 @@ impl ColumnarFileStream {
             (page_size / row_width).max(1)
         };
         Ok(Self {
-            mmap,
+            bytes,
             row_width,
             page_rows,
             total_rows,
@@ -1106,10 +1252,26 @@ impl ColumnarFileStream {
         })
     }
 
+    /// `true` when opened via [`ColumnarFileStream::open_int64_copied`].
+    #[inline(always)]
+    pub fn is_copied(&self) -> bool {
+        self.bytes.is_owned()
+    }
+
     /// Open an [`Int64ColumnFile`] (stream + validated meta).
     pub fn open_int64_column(bin_path: &Path, meta_path: &Path) -> io::Result<Int64ColumnFile> {
         let meta = read_int64_meta(meta_path)?;
-        let stream = Self::open_i64_inner(bin_path, Some(meta))?;
+        let stream = Self::open_i64_inner(bin_path, Some(meta), false)?;
+        Ok(Int64ColumnFile { stream, meta })
+    }
+
+    /// Crash-proof [`ColumnarFileStream::open_int64_column`].
+    pub fn open_int64_column_copied(
+        bin_path: &Path,
+        meta_path: &Path,
+    ) -> io::Result<Int64ColumnFile> {
+        let meta = read_int64_meta(meta_path)?;
+        let stream = Self::open_i64_inner(bin_path, Some(meta), true)?;
         Ok(Int64ColumnFile { stream, meta })
     }
 
@@ -1143,7 +1305,7 @@ impl ColumnarFileStream {
     }
 
     /// Advance `cursor_row` by `page_rows` (or the remainder) and return a
-    /// zero-copy borrowed slice view over the mmap.
+    /// borrowed slice view over the backing bytes (mmap or owned copy).
     ///
     /// Emits a final partial chunk when `total_rows % page_rows != 0`.
     #[inline(always)]
@@ -1165,18 +1327,13 @@ impl ColumnarFileStream {
             Some(e) => e,
             None => return None,
         };
-        if end > self.mmap.len() {
+        if end > self.bytes.byte_len() {
             return None;
         }
-        let bytes = &self.mmap[byte_off..end];
-        // SAFETY: (1) `n * row_width` bytes with `row_width == 8`; (2) mmap base
-        // is OS-page-aligned and page size is a multiple of 8 on POSIX, so
-        // `byte_off` (multiple of 8) yields an 8-byte-aligned `i64` pointer;
-        // (3) length covers exactly `n` i64 elements within the mapped region.
-        // Verified under Miri with isolation disabled on x86_64 Linux.
-        debug_assert_eq!(bytes.as_ptr() as usize % core::mem::align_of::<i64>(), 0);
-        let rows: &[i64] =
-            unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const i64, n) };
+        // SAFETY: bounds checked against backing length; Owned is naturally
+        // aligned `Vec<i64>`; Mmap base is page-aligned and `byte_off % 8 == 0`.
+        debug_assert_eq!(byte_off % core::mem::align_of::<i64>(), 0);
+        let rows: &[i64] = unsafe { self.bytes.rows_at(self.cursor_row, n) };
         let page_index = if self.page_rows == 0 {
             0
         } else {
@@ -1265,30 +1422,17 @@ impl ColumnarTableStream {
         let n = remaining.min(page_rows);
         let byte_off = start_row.wrapping_mul(8);
         let byte_end = byte_off.wrapping_add(n.wrapping_mul(8));
-        if byte_end > self.ages.mmap.len()
-            || byte_end > self.user_ids.mmap.len()
-            || byte_end > self.prices.mmap.len()
+        if byte_end > self.ages.bytes.byte_len()
+            || byte_end > self.user_ids.bytes.byte_len()
+            || byte_end > self.prices.bytes.byte_len()
         {
             return None;
         }
-        let ages = unsafe {
-            core::slice::from_raw_parts(
-                self.ages.mmap[byte_off..byte_end].as_ptr() as *const i64,
-                n,
-            )
-        };
-        let user_ids = unsafe {
-            core::slice::from_raw_parts(
-                self.user_ids.mmap[byte_off..byte_end].as_ptr() as *const i64,
-                n,
-            )
-        };
-        let prices = unsafe {
-            core::slice::from_raw_parts(
-                self.prices.mmap[byte_off..byte_end].as_ptr() as *const i64,
-                n,
-            )
-        };
+        // SAFETY: each stream's byte_end was bounds-checked; row windows share
+        // the same start_row/n; Mmap is page-aligned; Owned is Vec<i64>.
+        let ages = unsafe { self.ages.bytes.rows_at(start_row, n) };
+        let user_ids = unsafe { self.user_ids.bytes.rows_at(start_row, n) };
+        let prices = unsafe { self.prices.bytes.rows_at(start_row, n) };
         let page_index = if page_rows == 0 {
             0
         } else {
@@ -1313,42 +1457,63 @@ impl ColumnarTableStream {
 
 /// Cold-path: write a packed little-endian Int64 `.bin` + companion `.meta`.
 ///
-/// File payload is padded to the OS page size. Writes in stack windows of
-/// [`MAX_ROWS`] — never materializes the full column as `Vec` of values
-/// (padding uses a small page-sized buffer only at EOF).
+/// Writes to a sibling `*.bin.tmp` then renames into place so a mid-write
+/// failure (ENOSPC / EACCES) never leaves a `.bin`+`.meta` pair that a later
+/// `open_i64` would treat as a complete snapshot. File payload is padded to the
+/// OS page size. Writes in stack windows of [`MAX_ROWS`].
 pub fn write_i64_column_bin<F>(path: &Path, total_rows: usize, mut fill: F) -> io::Result<()>
 where
     F: FnMut(usize) -> i64,
 {
-    let mut file = File::create(path)?;
-    let mut window = [0i64; MAX_ROWS];
-    let mut written = 0usize;
-    while written < total_rows {
-        let n = (total_rows - written).min(MAX_ROWS);
-        let mut i = 0usize;
-        while i < n {
-            window[i] = fill(written + i);
-            i += 1;
+    let tmp_path = path.with_extension("bin.tmp");
+    let result = (|| -> io::Result<()> {
+        let mut file = File::create(&tmp_path)?;
+        let mut window = [0i64; MAX_ROWS];
+        let mut written = 0usize;
+        while written < total_rows {
+            let n = (total_rows - written).min(MAX_ROWS);
+            let mut i = 0usize;
+            while i < n {
+                window[i] = fill(written + i);
+                i += 1;
+            }
+            // SAFETY: `window` is a local `[i64; N]`; viewing `n` elements as
+            // little-endian bytes is valid for `write_all` on this LE host.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    window.as_ptr() as *const u8,
+                    n.wrapping_mul(core::mem::size_of::<i64>()),
+                )
+            };
+            file.write_all(bytes)?;
+            written += n;
         }
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                window.as_ptr() as *const u8,
-                n.wrapping_mul(core::mem::size_of::<i64>()),
-            )
-        };
-        file.write_all(bytes)?;
-        written += n;
+        let page_size = os_page_size_bytes();
+        pad_to_page(&mut file, page_size)?;
+        file.flush()?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
     }
-    let page_size = os_page_size_bytes();
-    pad_to_page(&mut file, page_size)?;
-    file.flush()?;
+    // Publish bin, then meta. If rename fails, remove tmp; if meta fails after
+    // rename, remove both so open never sees a half-published snapshot.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     let meta_path = path.with_extension("meta");
-    write_int64_meta(
+    if let Err(e) = write_int64_meta(
         &meta_path,
         &Int64ColumnMeta {
             row_count: total_rows as u64,
         },
-    )?;
+    ) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&meta_path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -1509,5 +1674,189 @@ mod tests {
         assert_eq!(f.get_row(0), Some("அருண்"));
         assert_eq!(f.get_row(1), Some("பிரியா"));
         assert_eq!(f.get_row(2), Some("கண்ணன்"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O / mmap unsupported under Miri isolation")]
+    fn open_int64_copied_survives_truncate() {
+        let dir = std::env::temp_dir().join("tamil_copied_truncate");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("col.bin");
+        write_i64_column_bin(&path, 2048, |i| (i as i64) * 3).unwrap();
+        let mut stream = ColumnarFileStream::open_int64_copied(&path).unwrap();
+        assert!(stream.is_copied());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let mut sum = 0i64;
+        let mut n = 0usize;
+        while let Some(c) = stream.next_page_chunk() {
+            n += c.row_count as usize;
+            if !c.rows.is_empty() {
+                sum = sum.wrapping_add(c.rows[0]);
+            }
+        }
+        assert_eq!(n, 2048);
+        assert_ne!(sum, 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn corrupt_meta_row_count_rejected() {
+        let dir = std::env::temp_dir().join("tamil_corrupt_meta");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("col.bin");
+        write_i64_column_bin(&path, 16, |i| i as i64).unwrap();
+        let meta = path.with_extension("meta");
+        // Lie: claim 1_000_000 rows while file only holds 16 (+ page pad).
+        std::fs::write(&meta, 1_000_000u64.to_le_bytes()).unwrap();
+        let err = match ColumnarFileStream::open_i64_with_meta(&path, &meta) {
+            Ok(_) => panic!("corrupt meta must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err2 = match ColumnarFileStream::open_int64_copied_with_meta(&path, &meta) {
+            Ok(_) => panic!("corrupt meta must fail (copied)"),
+            Err(e) => e,
+        };
+        assert_eq!(err2.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O + threads")]
+    fn concurrent_mmap_readers_same_file() {
+        let dir = std::env::temp_dir().join("tamil_concurrent_readers");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("col.bin");
+        const N: usize = 4096;
+        write_i64_column_bin(&path, N, |i| i as i64).unwrap();
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let t1 = std::thread::spawn(move || {
+            let mut s = ColumnarFileStream::open_i64(&path_a).unwrap();
+            let mut sum = 0i64;
+            let mut n = 0usize;
+            while let Some(c) = s.next_page_chunk() {
+                n += c.row_count as usize;
+                for &v in c.rows {
+                    sum = sum.wrapping_add(v);
+                }
+            }
+            (n, sum)
+        });
+        let t2 = std::thread::spawn(move || {
+            let mut s = ColumnarFileStream::open_i64(&path_b).unwrap();
+            let mut sum = 0i64;
+            let mut n = 0usize;
+            while let Some(c) = s.next_page_chunk() {
+                n += c.row_count as usize;
+                for &v in c.rows {
+                    sum = sum.wrapping_add(v);
+                }
+            }
+            (n, sum)
+        });
+        let (n1, s1) = t1.join().unwrap();
+        let (n2, s2) = t2.join().unwrap();
+        let expected_sum: i64 = (0..N as i64).sum();
+        assert_eq!(n1, N);
+        assert_eq!(n2, N);
+        assert_eq!(s1, expected_sum);
+        assert_eq!(s2, expected_sum);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn utf8_grapheme_spans_page_boundary_in_blob() {
+        let dir = std::env::temp_dir().join("tamil_utf8_page_span");
+        let _ = std::fs::create_dir_all(&dir);
+        let offsets = dir.join("n.offsets");
+        let blob = dir.join("n.blob");
+        let meta = dir.join("n.meta");
+        let page = os_page_size_bytes();
+        // Pad so the Tamil grapheme "தே" (6 bytes) straddles an OS page boundary
+        // inside the blob: 3 bytes before the boundary, 3 after.
+        let grapheme = "தே".as_bytes();
+        assert_eq!(grapheme.len(), 6);
+        let mut prefix = vec![b'B'; page - 3];
+        prefix.extend_from_slice(grapheme);
+        assert!(prefix.len() > page);
+        assert_eq!(&prefix[page - 3..page + 3], grapheme);
+        let rows: [&[u8]; 1] = [prefix.as_slice()];
+        write_utf8_column_files(&offsets, &blob, &meta, &rows).unwrap();
+        let f = Utf8ColumnFile::open(&offsets, &blob, Some(&meta)).unwrap();
+        let got = f.get_row(0).expect("row");
+        assert!(
+            got.ends_with("தே"),
+            "must not truncate mid-codepoint; got {got:?}"
+        );
+        assert!(got.is_char_boundary(got.len()));
+        assert_eq!(&got.as_bytes()[got.len() - 6..], grapheme);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn write_int64_permission_denied_clean() {
+        let dir = std::env::temp_dir().join("tamil_write_perm_denied");
+        let _ = std::fs::create_dir_all(&dir);
+        let readonly = dir.join("ro");
+        let _ = std::fs::remove_dir_all(&readonly);
+        std::fs::create_dir_all(&readonly).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&readonly, perms).unwrap();
+        }
+        let path = readonly.join("col.bin");
+        let err = write_i64_column_bin(&path, 8, |i| i as i64).unwrap_err();
+        assert!(
+            err.kind() == std::io::ErrorKind::PermissionDenied
+                || err.kind() == std::io::ErrorKind::ReadOnlyFilesystem
+                || err.raw_os_error() == Some(13)
+                || err.raw_os_error() == Some(30),
+            "expected permission error, got {err:?}"
+        );
+        assert!(!path.exists(), "must not leave a published .bin on failure");
+        assert!(
+            !path.with_extension("meta").exists(),
+            "must not leave a published .meta on failure"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn write_int64_enospc_via_dev_full_pattern() {
+        // Prove the write path surfaces ENOSPC as `io::Error` (not a panic) by
+        // writing directly to `/dev/full`. `write_i64_column_bin` uses a sibling
+        // `.bin.tmp` next to the destination, so we exercise the same `write_all`
+        // failure mode the ingest path hits when the filesystem is full.
+        let path = std::path::Path::new("/dev/full");
+        if !path.exists() {
+            return;
+        }
+        let mut f = match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let buf = [1u8; 4096];
+        let err = f.write_all(&buf).unwrap_err();
+        assert!(
+            err.raw_os_error() == Some(28) || err.kind() == std::io::ErrorKind::StorageFull,
+            "expected ENOSPC from /dev/full, got {err:?}"
+        );
     }
 }

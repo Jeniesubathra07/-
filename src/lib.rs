@@ -26,12 +26,12 @@ pub use runtime::{
     EngineError, EngineScratchPad, GroupedAgg, MmapStreamStats, QueryResult, RadixScratchPad, RuntimeScratch,
 };
 pub use storage::{
-    os_page_size_bytes, seed_orders_database, seed_orders_table, seed_users_table,
-    write_i64_column_bin, write_stage4_columnar_demo, write_utf8_column_files, Catalog, ColName,
-    ColumnData, ColumnarChunk, ColumnarFileStream, ColumnarTablePage, ColumnarTableStream,
-    FixedOrdersDatabase, Int64Column, Int64ColumnFile, Int64ColumnMeta, PhysType, SelectionVector,
-    Table, Utf8Column, Utf8ColumnFile, Utf8ColumnMeta, Utf8OffsetEntry, BATCH_ROWS, MAX_ROWS,
-    NAME_CAP,
+    dup_price_orders_catalog, os_page_size_bytes, seed_dup_price_orders_table, seed_orders_database,
+    seed_orders_table, seed_users_table, write_i64_column_bin, write_stage4_columnar_demo,
+    write_utf8_column_files, Catalog, ColName, ColumnData, ColumnarChunk, ColumnarFileStream,
+    ColumnarTablePage, ColumnarTableStream, FixedOrdersDatabase, Int64Column, Int64ColumnFile,
+    Int64ColumnMeta, PhysType, SelectionVector, Table, Utf8Column, Utf8ColumnFile, Utf8ColumnMeta,
+    Utf8OffsetEntry, BATCH_ROWS, MAX_ROWS, NAME_CAP,
 };
 pub use parser::{
     alloc_token_window, parse_query, AstArena, AstNode, NodeKind, OpKind, ParseError, Parser, ParserError, AST_CAP, NIL,
@@ -1986,5 +1986,77 @@ mod e2e_tests {
             assert_eq!(scratch.groups.sum[i], scratch.groups.keys[i]);
             i += 1;
         }
+    }
+
+    /// Multi-row GroupedAgg (groups of size 3+) with hand-computed expectations.
+    #[test]
+    fn test_group_multi_row_count_sum_min_max_e2e() {
+        let catalog = dup_price_orders_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        let q = "இருந்து ஆர்டர்கள் | தொகுப்பு விலை | தேடு விலை;";
+        assert!(run_query_checked(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
+        // Sorted distinct keys: 100, 250, 500
+        assert_eq!(out.row_count, 3);
+        assert_eq!(scratch.groups.len, 3);
+        assert_eq!(out.int_out[0].values[0], 100);
+        assert_eq!(out.int_out[0].values[1], 250);
+        assert_eq!(out.int_out[0].values[2], 500);
+        // Hand-computed: 100×3, 250×4, 500×1
+        assert_eq!(scratch.groups.count[0], 3);
+        assert_eq!(scratch.groups.sum[0], 300);
+        assert_eq!(scratch.groups.min[0], 100);
+        assert_eq!(scratch.groups.max[0], 100);
+        assert_eq!(scratch.groups.count[1], 4);
+        assert_eq!(scratch.groups.sum[1], 1000);
+        assert_eq!(scratch.groups.min[1], 250);
+        assert_eq!(scratch.groups.max[1], 250);
+        assert_eq!(scratch.groups.count[2], 1);
+        assert_eq!(scratch.groups.sum[2], 500);
+        assert_eq!(scratch.groups.min[2], 500);
+        assert_eq!(scratch.groups.max[2], 500);
+
+        let q2 = "இருந்து ஆர்டர்கள் | தொகுப்பு விலை | தேடு எண்ணிக்கை;";
+        assert!(run_query_checked(q2, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
+        assert_eq!(out.row_count, 3);
+        assert_eq!(out.int_out[0].values[0], 3);
+        assert_eq!(out.int_out[0].values[1], 4);
+        assert_eq!(out.int_out[0].values[2], 1);
+    }
+
+    /// Empty table end-to-end through `run_query_checked`.
+    #[test]
+    fn test_empty_table_query_e2e() {
+        let mut cat = Catalog::new();
+        let mut t = Table::new_boxed("வெறுமை".as_bytes());
+        let _ = t.add_int64_column("வயது".as_bytes()).unwrap();
+        t.set_row_count(0);
+        let _ = cat.register_box(t);
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        let q = "இருந்து வெறுமை | வடி வயது > 0 | தேடு வயது;";
+        assert!(run_query_checked(q, &cat, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
+        assert_eq!(out.row_count, 0);
+    }
+
+    /// Zero-row Int64 column file open + query-shaped stream walk.
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn test_empty_column_file_stream_e2e() {
+        let dir = std::env::temp_dir().join("tamil_empty_col_e2e");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("empty.bin");
+        write_i64_column_bin(&path, 0, |_| 0).unwrap();
+        let mut stream = ColumnarFileStream::open_i64(&path).unwrap();
+        assert_eq!(stream.total_rows(), 0);
+        assert!(stream.next_page_chunk().is_none());
+        let mut copied = ColumnarFileStream::open_int64_copied(&path).unwrap();
+        assert!(copied.is_copied());
+        assert_eq!(copied.total_rows(), 0);
+        assert!(copied.next_page_chunk().is_none());
     }
 }
