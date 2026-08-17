@@ -65,3 +65,14 @@ Deltas are noise-level for the demo path; untrusted boundaries also use `checked
 - libFuzzer (libc++ headers historically missing); pure-Rust fuzz driver remains
 - Windows / big-endian / real disk-full / concurrent writers
 - Signal-handler SIGBUS recovery (documented unmitigated; EXIT 135 observed)
+
+## Addendum — GroupedAgg
+
+`RuntimeScratch.groups: GroupedAgg` (`#[repr(C, align(64))]`) stores per-group
+`keys/count/sum/min/max` filled during sort-then-scan. For the group-key column
+these four are exact (all members share the key). `சுருக்கு` surfaces SUM into
+`derived`. See `test_group_count_derived_e2e`.
+
+## Unsafe
+
+See `docs/UNSAFE_AUDIT.md` (39–44 keyword hits depending on grep form).

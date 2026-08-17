@@ -23,7 +23,7 @@ pub use runtime::{
     demo_catalog, execute_chunk_parallel, execute_chunk_parallel_os,
     execute_mmap_age_filter_stream, execute_mmap_table_filter_project_stream, lsd_radix_sort_ages,
     lsd_radix_sort_ages_tls, run_query, run_query_checked, vector_merge_join, ArithOp, ChunkScratch, Engine,
-    EngineError, EngineScratchPad, MmapStreamStats, QueryResult, RadixScratchPad, RuntimeScratch,
+    EngineError, EngineScratchPad, GroupedAgg, MmapStreamStats, QueryResult, RadixScratchPad, RuntimeScratch,
 };
 pub use storage::{
     os_page_size_bytes, seed_orders_database, seed_orders_table, seed_users_table,
@@ -1963,5 +1963,28 @@ mod e2e_tests {
         let q2 = "இருந்து பயனர்கள் | இணை ஆர்டர்கள் | இணை ஆர்டர்கள் | தேடு பெயர்;";
         assert!(run_query_checked(q2, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
         assert_eq!(out.row_count, 12, "double join must preserve 1:1 order cardinality");
+    }
+
+    /// After Group, `எண்ணிக்கை` holds per-group COUNT (all 1 for unique prices).
+    #[test]
+    fn test_group_count_derived_e2e() {
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        let q = "இருந்து ஆர்டர்கள் | தொகுப்பு விலை | தேடு எண்ணிக்கை;";
+        assert!(run_query_checked(q, &catalog, &mut arena, &mut out, &mut scratch, &mut tokens).is_ok());
+        assert_eq!(out.row_count, 12);
+        assert_eq!(scratch.groups.len, 12);
+        let mut i = 0usize;
+        while i < 12 {
+            assert_eq!(out.int_out[0].values[i], 1);
+            assert_eq!(scratch.groups.count[i], 1);
+            assert_eq!(scratch.groups.min[i], scratch.groups.keys[i]);
+            assert_eq!(scratch.groups.max[i], scratch.groups.keys[i]);
+            assert_eq!(scratch.groups.sum[i], scratch.groups.keys[i]);
+            i += 1;
+        }
     }
 }

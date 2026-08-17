@@ -177,6 +177,40 @@ pub struct RuntimeScratch {
     /// 1 when `derived` / `derived_name` are live.
     pub has_derived: u8,
     pub _pad_d: [u8; 7],
+    /// Fixed-capacity group aggregates (no `HashMap`).
+    pub groups: GroupedAgg,
+}
+
+/// Sort-then-scan group aggregates — one slot per distinct key, cap [`MAX_ROWS`].
+#[repr(C, align(64))]
+pub struct GroupedAgg {
+    pub keys: [i64; MAX_ROWS],
+    pub count: [i64; MAX_ROWS],
+    pub sum: [i64; MAX_ROWS],
+    pub min: [i64; MAX_ROWS],
+    pub max: [i64; MAX_ROWS],
+    pub len: u16,
+    pub _pad: [u8; 6],
+}
+
+impl GroupedAgg {
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self {
+            keys: [0; MAX_ROWS],
+            count: [0; MAX_ROWS],
+            sum: [0; MAX_ROWS],
+            min: [0; MAX_ROWS],
+            max: [0; MAX_ROWS],
+            len: 0,
+            _pad: [0; 6],
+        }
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
 }
 
 impl RuntimeScratch {
@@ -196,6 +230,7 @@ impl RuntimeScratch {
             derived_name: ColName::empty(),
             has_derived: 0,
             _pad_d: [0; 7],
+            groups: GroupedAgg::empty(),
         }
     }
 
@@ -210,6 +245,7 @@ impl RuntimeScratch {
             }
             (*ptr).derived_name = ColName::empty();
             (*ptr).has_derived = 0;
+            (*ptr).groups.len = 0;
             Box::from_raw(ptr)
         }
     }
@@ -1715,6 +1751,12 @@ impl<'a> Engine<'a> {
             let count = (end - run) as i64;
             let rep_dense = scratch.left_order[run] as usize;
             scratch.tmp_u16[out_n] = scratch.order[rep_dense];
+            // Group-key aggregates are exact: every member shares `key0`.
+            scratch.groups.keys[out_n] = key0;
+            scratch.groups.count[out_n] = count;
+            scratch.groups.sum[out_n] = key0.wrapping_mul(count);
+            scratch.groups.min[out_n] = key0;
+            scratch.groups.max[out_n] = key0;
             scratch.left_dense[out_n] = key0;
             scratch.derived[out_n] = count;
             out_n += 1;
@@ -1726,6 +1768,7 @@ impl<'a> Engine<'a> {
             scratch.key_buf[g] = scratch.left_dense[g];
             g += 1;
         }
+        scratch.groups.len = out_n as u16;
         *order_len = out_n;
         *sorted = true;
         // Keep join maps intact; `order[g]` remains a representative source/join slot.
@@ -1735,9 +1778,8 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// `சுருக்கு <col>` — per-group SUM/MIN/MAX of an i64 measure (COUNT already in
-    /// `derived` from Group). When the measure equals the group key (common for
-    /// `தொகுப்பு விலை | சுருக்கு விலை`), SUM = key × count and MIN = MAX = key.
+    /// `சுருக்கு <col>` — surface per-group SUM from [`GroupedAgg`] into `derived`
+    /// (COUNT/MIN/MAX remain available on `scratch.groups`).
     fn apply_aggregate(
         &self,
         stage: &AstNode,
@@ -1756,14 +1798,16 @@ impl<'a> Engine<'a> {
             None => return Err(EngineError::ParseFailed),
         };
         let col_name = self.expect_ident_bytes(col_node)?;
-        let grouped = scratch.has_derived != 0
-            && scratch.derived_name.eq_bytes("எண்ணிக்கை".as_bytes())
-            && sorted
-            && order_len > 0;
+        let grouped = scratch.groups.len as usize == order_len
+            && order_len > 0
+            && sorted;
 
         if grouped {
+            let n = order_len.min(scratch.groups.len as usize);
             let mut g = 0usize;
-            while g < order_len {
+            while g < n {
+                // Prefer exact group-key SUM when measure matches the grouped key
+                // at the representative; otherwise approximate as rep * count.
                 let slot = scratch.order[g] as usize;
                 let v = Self::row_i64_at(
                     table,
@@ -1774,14 +1818,11 @@ impl<'a> Engine<'a> {
                     col_name,
                     slot,
                 )?;
-                let count = scratch.derived[g];
-                let gkey = scratch.key_buf[g];
-                // If measure matches group key at representative, all members share
-                // that key → SUM = key * count. Otherwise SUM of measure over an
-                // unexpanded group is approximated by the representative value
-                // times count (documented limitation without member lists).
-                let _ = gkey;
-                scratch.derived[g] = v.wrapping_mul(count);
+                if v == scratch.groups.keys[g] {
+                    scratch.derived[g] = scratch.groups.sum[g];
+                } else {
+                    scratch.derived[g] = v.wrapping_mul(scratch.groups.count[g]);
+                }
                 g += 1;
             }
             scratch.derived_name = ColName::from_bytes(col_name);
@@ -1792,6 +1833,9 @@ impl<'a> Engine<'a> {
         // Global SUM over ordered selection (or empty).
         let n = if sorted { order_len } else { 0 };
         let mut sum = 0i64;
+        let mut mn = i64::MAX;
+        let mut mx = i64::MIN;
+        let mut count = 0i64;
         let mut i = 0usize;
         while i < n {
             let slot = scratch.order[i] as usize;
@@ -1805,7 +1849,23 @@ impl<'a> Engine<'a> {
                 slot,
             )?;
             sum = sum.wrapping_add(v);
+            if v < mn {
+                mn = v;
+            }
+            if v > mx {
+                mx = v;
+            }
+            count += 1;
             i += 1;
+        }
+        scratch.groups.clear();
+        if count > 0 {
+            scratch.groups.keys[0] = 0;
+            scratch.groups.count[0] = count;
+            scratch.groups.sum[0] = sum;
+            scratch.groups.min[0] = mn;
+            scratch.groups.max[0] = mx;
+            scratch.groups.len = 1;
         }
         scratch.derived[0] = sum;
         scratch.derived_name = ColName::from_bytes(col_name);
