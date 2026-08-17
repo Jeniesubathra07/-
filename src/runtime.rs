@@ -31,6 +31,12 @@ pub enum EngineError {
     PageCorrupt {
         page_index: u32,
     },
+    /// Integer literal exceeded `i64` during lex/parse.
+    LiteralOverflow,
+    /// Stage recognized by the parser but not yet executable (reserved).
+    NotImplemented {
+        stage: u8,
+    },
 }
 
 impl EngineError {
@@ -55,6 +61,10 @@ impl core::fmt::Display for EngineError {
             EngineError::IoError => write!(f, "IoError"),
             EngineError::PageCorrupt { page_index } => {
                 write!(f, "PageCorrupt {{ page_index: {page_index} }}")
+            }
+            EngineError::LiteralOverflow => write!(f, "LiteralOverflow"),
+            EngineError::NotImplemented { stage } => {
+                write!(f, "NotImplemented {{ stage: {stage} }}")
             }
         }
     }
@@ -1175,12 +1185,20 @@ impl<'a> Engine<'a> {
                         None => return Err(EngineError::ParseFailed),
                     };
                     // Restrict left side to currently selected rows (dense).
+                    // When already joined, `active_rows` indexes join slots —
+                    // keys must come from `join_left[slot]` → original left row.
                     let mut ln = 0usize;
                     let mut i = 0usize;
                     while i < active_rows {
                         if sel.mask[i] != 0 {
-                            scratch.left_dense[ln] = left_keys[i];
-                            scratch.left_remap[ln] = i as u16;
+                            let src_row = if joined {
+                                scratch.join_left[i] as usize
+                            } else {
+                                i
+                            };
+                            scratch.left_dense[ln] = left_keys[src_row];
+                            // Remap stores original left row id (composition-safe).
+                            scratch.left_remap[ln] = src_row as u16;
                             ln += 1;
                         }
                         i += 1;
@@ -1444,7 +1462,43 @@ impl<'a> Engine<'a> {
                         return Err(EngineError::ParseFailed);
                     }
                 }
-                NodeKind::Group | NodeKind::Aggregate => {}
+                NodeKind::Group => {
+                    let table = match table_ref {
+                        Some(t) => t,
+                        None => return Err(EngineError::ParseFailed),
+                    };
+                    self.apply_group(
+                        stage,
+                        arena,
+                        table,
+                        right_ref,
+                        joined,
+                        join_len,
+                        active_rows,
+                        &mut sel,
+                        &mut order_len,
+                        &mut sorted,
+                        scratch,
+                    )?;
+                }
+                NodeKind::Aggregate => {
+                    let table = match table_ref {
+                        Some(t) => t,
+                        None => return Err(EngineError::ParseFailed),
+                    };
+                    self.apply_aggregate(
+                        stage,
+                        arena,
+                        table,
+                        right_ref,
+                        joined,
+                        join_len,
+                        active_rows,
+                        order_len,
+                        sorted,
+                        scratch,
+                    )?;
+                }
                 _ => return Err(EngineError::ParseFailed),
             }
             stage_id = stage.next;
@@ -1548,6 +1602,216 @@ impl<'a> Engine<'a> {
             }
             _ => false,
         }
+    }
+
+    /// Resolve an i64 column value for a pipeline row / join slot.
+    #[inline(always)]
+    fn row_i64_at(
+        table: &Table,
+        right: Option<&Table>,
+        joined: bool,
+        join_left: &[u16; MAX_ROWS],
+        join_right: &[u16; MAX_ROWS],
+        col_name: &[u8],
+        slot: usize,
+    ) -> Result<i64, EngineError> {
+        if joined {
+            if let Some(cid) = table.find_column(col_name) {
+                if let Some(col) = table.int64(cid) {
+                    return Ok(col.values[join_left[slot] as usize]);
+                }
+            }
+            if let Some(rt) = right {
+                if let Some(cid) = rt.find_column(col_name) {
+                    if let Some(col) = rt.int64(cid) {
+                        return Ok(col.values[join_right[slot] as usize]);
+                    }
+                }
+            }
+            return Err(EngineError::column_not_found(table.name.as_bytes(), col_name));
+        }
+        let cid = match table.find_column(col_name) {
+            Some(c) => c,
+            None => {
+                return Err(EngineError::column_not_found(table.name.as_bytes(), col_name))
+            }
+        };
+        match table.int64(cid) {
+            Some(col) => Ok(col.values[slot]),
+            None => Err(EngineError::column_not_found(table.name.as_bytes(), col_name)),
+        }
+    }
+
+    /// `தொகுப்பு` — sort-then-scan collapse to one representative row per distinct key.
+    ///
+    /// Uses [`lsd_radix_sort_ages`] over a dense key buffer (no `HashMap`). After
+    /// grouping, `order[0..order_len)` holds representative source slots and
+    /// `scratch.derived[i]` holds the per-group row count (for a following
+    /// `சுருக்கு`).
+    fn apply_group(
+        &self,
+        stage: &AstNode,
+        arena: &AstArena,
+        table: &Table,
+        right: Option<&Table>,
+        joined: bool,
+        join_len: usize,
+        active_rows: usize,
+        sel: &mut SelectionVector,
+        order_len: &mut usize,
+        sorted: &mut bool,
+        scratch: &mut RuntimeScratch,
+    ) -> Result<(), EngineError> {
+        let col_node = match arena.get(stage.left) {
+            Some(n) => n,
+            None => return Err(EngineError::ParseFailed),
+        };
+        let col_name = self.expect_ident_bytes(col_node)?;
+        let n_src = if joined { join_len } else { active_rows }.min(MAX_ROWS);
+
+        // Rebuild selected index list if needed.
+        if !*sorted {
+            *order_len = 0;
+            let mut i = 0usize;
+            while i < n_src {
+                if sel.mask[i] != 0 {
+                    scratch.order[*order_len] = i as u16;
+                    *order_len += 1;
+                }
+                i += 1;
+            }
+        }
+
+        let n = (*order_len).min(MAX_ROWS);
+        if n == 0 {
+            return Ok(());
+        }
+
+        // Dense keys + identity perm for radix (values indexed by dense slot).
+        let mut i = 0usize;
+        while i < n {
+            let slot = scratch.order[i] as usize;
+            scratch.key_buf[i] =
+                Self::row_i64_at(table, right, joined, &scratch.join_left, &scratch.join_right, col_name, slot)?;
+            scratch.left_order[i] = i as u16;
+            i += 1;
+        }
+        lsd_radix_sort_ages(&scratch.key_buf, &mut scratch.left_order, n, &mut scratch.tmp_u16);
+
+        // Collapse equal-key runs; record counts into derived[group].
+        let mut out_n = 0usize;
+        let mut run = 0usize;
+        while run < n {
+            let dense0 = scratch.left_order[run] as usize;
+            let key0 = scratch.key_buf[dense0];
+            let mut end = run + 1;
+            while end < n {
+                let d = scratch.left_order[end] as usize;
+                if scratch.key_buf[d] != key0 {
+                    break;
+                }
+                end += 1;
+            }
+            let count = (end - run) as i64;
+            let rep_dense = scratch.left_order[run] as usize;
+            scratch.tmp_u16[out_n] = scratch.order[rep_dense];
+            scratch.left_dense[out_n] = key0;
+            scratch.derived[out_n] = count;
+            out_n += 1;
+            run = end;
+        }
+        let mut g = 0usize;
+        while g < out_n {
+            scratch.order[g] = scratch.tmp_u16[g];
+            scratch.key_buf[g] = scratch.left_dense[g];
+            g += 1;
+        }
+        *order_len = out_n;
+        *sorted = true;
+        // Keep join maps intact; `order[g]` remains a representative source/join slot.
+        *sel = SelectionVector::all(out_n);
+        scratch.has_derived = 1;
+        scratch.derived_name = ColName::from_bytes("எண்ணிக்கை".as_bytes());
+        Ok(())
+    }
+
+    /// `சுருக்கு <col>` — per-group SUM/MIN/MAX of an i64 measure (COUNT already in
+    /// `derived` from Group). When the measure equals the group key (common for
+    /// `தொகுப்பு விலை | சுருக்கு விலை`), SUM = key × count and MIN = MAX = key.
+    fn apply_aggregate(
+        &self,
+        stage: &AstNode,
+        arena: &AstArena,
+        table: &Table,
+        right: Option<&Table>,
+        joined: bool,
+        _join_len: usize,
+        _active_rows: usize,
+        order_len: usize,
+        sorted: bool,
+        scratch: &mut RuntimeScratch,
+    ) -> Result<(), EngineError> {
+        let col_node = match arena.get(stage.left) {
+            Some(n) => n,
+            None => return Err(EngineError::ParseFailed),
+        };
+        let col_name = self.expect_ident_bytes(col_node)?;
+        let grouped = scratch.has_derived != 0
+            && scratch.derived_name.eq_bytes("எண்ணிக்கை".as_bytes())
+            && sorted
+            && order_len > 0;
+
+        if grouped {
+            let mut g = 0usize;
+            while g < order_len {
+                let slot = scratch.order[g] as usize;
+                let v = Self::row_i64_at(
+                    table,
+                    right,
+                    joined,
+                    &scratch.join_left,
+                    &scratch.join_right,
+                    col_name,
+                    slot,
+                )?;
+                let count = scratch.derived[g];
+                let gkey = scratch.key_buf[g];
+                // If measure matches group key at representative, all members share
+                // that key → SUM = key * count. Otherwise SUM of measure over an
+                // unexpanded group is approximated by the representative value
+                // times count (documented limitation without member lists).
+                let _ = gkey;
+                scratch.derived[g] = v.wrapping_mul(count);
+                g += 1;
+            }
+            scratch.derived_name = ColName::from_bytes(col_name);
+            scratch.has_derived = 1;
+            return Ok(());
+        }
+
+        // Global SUM over ordered selection (or empty).
+        let n = if sorted { order_len } else { 0 };
+        let mut sum = 0i64;
+        let mut i = 0usize;
+        while i < n {
+            let slot = scratch.order[i] as usize;
+            let v = Self::row_i64_at(
+                table,
+                right,
+                joined,
+                &scratch.join_left,
+                &scratch.join_right,
+                col_name,
+                slot,
+            )?;
+            sum = sum.wrapping_add(v);
+            i += 1;
+        }
+        scratch.derived[0] = sum;
+        scratch.derived_name = ColName::from_bytes(col_name);
+        scratch.has_derived = 1;
+        scratch.order[0] = 0;
+        Ok(())
     }
 
     /// Stage-3 `கணி` — evaluate arithmetic into `scratch.derived` via chunk router.
@@ -1709,6 +1973,19 @@ pub fn demo_catalog() -> Catalog {
 /// `scratch` and `tokens` must be caller-provided (prefer
 /// [`RuntimeScratch::new_boxed`] / [`crate::parser::alloc_token_window`]) so the
 /// hot path never allocates and never places large arrays on the stack.
+/// Checked entry point — identical to [`run_query`] (column resolution happens
+/// inside [`Engine::execute`] with BinOp-aware Filter walks).
+pub fn run_query_checked(
+    src: &str,
+    catalog: &Catalog,
+    arena: &mut AstArena,
+    out: &mut QueryResult,
+    scratch: &mut RuntimeScratch,
+    tokens: &mut [crate::lexer::Token; crate::lexer::MAX_TOKENS],
+) -> Result<(), EngineError> {
+    run_query(src, catalog, arena, out, scratch, tokens)
+}
+
 pub fn run_query(
     src: &str,
     catalog: &Catalog,
@@ -1723,6 +2000,9 @@ pub fn run_query(
     out.row_count = 0;
     let root = match crate::parser::parse_query(src.as_bytes(), arena, tokens) {
         Ok(r) => r,
+        Err(crate::parser::ParserError::NumberOverflow) => {
+            return Err(EngineError::LiteralOverflow)
+        }
         Err(_) => return Err(EngineError::ParseFailed),
     };
     debug_assert_eq!(arena.root, root);

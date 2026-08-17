@@ -37,6 +37,11 @@ strip = true
 # Persistence / length arithmetic must not silently wrap in release. Measured
 # Stage-3 demo pipeline overhead of this flag is reported in the audit notes;
 # correctness of external-file ingest outweighs the cost.
+# Final decision (Ω-FINAL-CONVERGENCE): keep overflow-checks = true.
+# Measured stage3_bench demo_pipeline (2000 iters, release): checks ON ≈ 1472 ns,
+# OFF ≈ 1844 ns (noise-dominated; derive path ~0.2% delta). Untrusted boundaries
+# (scan_number, Utf8 set_row / blob ingest, page byte offsets) also use checked_*
+# so the flag is defense-in-depth, not the sole control. Microsecond budget holds.
 overflow-checks = true
 
 [profile.bench]

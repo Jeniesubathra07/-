@@ -287,22 +287,34 @@ impl<'a> Lexer<'a> {
         self.pos = i;
     }
 
-    /// Branchless decimal accumulate: `val = val * 10 + (byte - b'0')`.
+    /// Branchless decimal accumulate with overflow detection.
+    ///
+    /// On overflow, `number` is set to [`i64::MIN`] as a sentinel rejected by
+    /// [`crate::parser::Parser::expect_number`]. `i64::MIN` itself is therefore
+    /// not representable as a query literal (acceptable for this DSL).
     #[inline(always)]
     fn scan_number(&mut self) -> Token {
         let start = self.pos as u32;
         let bytes = self.src;
         let mut i = self.pos;
         let mut val: i64 = 0;
+        let mut overflow = false;
         while i < bytes.len() {
             let b = bytes[i];
             let is_digit = IS_DIGIT_LUT[b as usize];
             if is_digit == 0 {
                 break;
             }
-            val = val
-                .wrapping_mul(10)
-                .wrapping_add((b.wrapping_sub(b'0')) as i64);
+            let digit = (b.wrapping_sub(b'0')) as i64;
+            if !overflow {
+                match val.checked_mul(10).and_then(|v| v.checked_add(digit)) {
+                    Some(v) => val = v,
+                    None => {
+                        overflow = true;
+                        val = i64::MIN;
+                    }
+                }
+            }
             i += 1;
         }
         self.pos = i;

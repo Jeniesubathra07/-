@@ -30,6 +30,8 @@ pub enum ParserError {
     EmptyInput = 4,
     /// Pipeline stage appeared before an `இருந்து` (Irundu) source was registered.
     MissingSourceContext = 5,
+    /// Integer literal overflowed `i64` during lex (sentinel `i64::MIN`).
+    NumberOverflow = 6,
 }
 
 /// AST / pipeline operator kind (alias for [`NodeKind`]; includes `Join`).
@@ -285,6 +287,16 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Number token that is not the overflow sentinel (`i64::MIN`).
+    #[inline(always)]
+    fn expect_number(&mut self) -> Result<Token, ParserError> {
+        let t = self.expect(TokenKind::Number)?;
+        if t.number == i64::MIN {
+            return Err(ParserError::NumberOverflow);
+        }
+        Ok(t)
+    }
+
     #[inline(always)]
     fn alloc_ident(&mut self, arena: &mut AstArena, tok: Token) -> Result<u32, ParserError> {
         arena.try_alloc(AstNode {
@@ -349,7 +361,7 @@ impl<'a> Parser<'a> {
         if !op_ok {
             return Err(ParserError::UnexpectedToken);
         }
-        let lit_tok = self.expect(TokenKind::Number)?;
+        let lit_tok = self.expect_number()?;
         let lit = self.alloc_literal(arena, lit_tok)?;
         let bin = arena.try_alloc(AstNode {
             kind: NodeKind::BinOp,
@@ -394,7 +406,7 @@ impl<'a> Parser<'a> {
 
     fn parse_take(&mut self, arena: &mut AstArena) -> Result<u32, ParserError> {
         self.expect(TokenKind::Edu)?;
-        let n_tok = self.expect(TokenKind::Number)?;
+        let n_tok = self.expect_number()?;
         arena.try_alloc(AstNode {
             kind: NodeKind::Take,
             op: TokenKind::Edu,
@@ -476,7 +488,7 @@ impl<'a> Parser<'a> {
                 self.alloc_ident(arena, tok)
             }
             TokenKind::Number => {
-                let tok = self.bump();
+                let tok = self.expect_number()?;
                 self.alloc_literal(arena, tok)
             }
             _ => Err(ParserError::UnexpectedToken),

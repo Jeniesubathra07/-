@@ -32,6 +32,10 @@ fn main() {
             EngineError::PageCorrupt { page_index } => {
                 eprintln!("error: PageCorrupt {{ page_index: {page_index} }}");
             }
+            EngineError::LiteralOverflow => eprintln!("error: LiteralOverflow"),
+            EngineError::NotImplemented { stage } => {
+                eprintln!("error: NotImplemented {{ stage: {stage} }}");
+            }
         }
         eprintln!("query: {query}");
         process::exit(1);
