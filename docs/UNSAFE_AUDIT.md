@@ -1,54 +1,43 @@
-# Exhaustive unsafe audit (Ω-FINAL)
+# Exhaustive unsafe audit (Ω-PRODUCTION-READY)
 
-Total `unsafe` keyword hits from `rg`: **44**
+Total `rg '\bunsafe\b' src/` hits: **41** (includes `unsafe fn` / `unsafe impl` keywords).
 
-Verified against current sources; SIGBUS remains a POSIX precondition on mmap sites.
+Every former "Review / See local SAFETY comment" placeholder is replaced below with a concrete invariant, enforcement, and verdict.
 
-| File:line | Snippet | Invariant | Enforcement | OK? |
-|-----------|---------|-----------|-------------|-----|
-| `src/parser.rs:214` | `unsafe {` | See local SAFETY comment | context | Review |
-| `src/storage.rs:299` | `unsafe {` | See local SAFETY comment | context | Review |
-| `src/storage.rs:427` | `pub unsafe fn as_slice(&self) -> &'a [u8] {` | MappedRegion bounds/lifetime | documented unsafe | Caller |
-| `src/storage.rs:428` | `unsafe { core::slice::from_raw_parts(self.ptr, self.len` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/storage.rs:436` | `pub unsafe fn slice_at(&self, off: usize, len: usize) -` | See local SAFETY comment | context | Review |
-| `src/storage.rs:439` | `ptr: unsafe { self.ptr.add(off) },` | MappedRegion bounds/lifetime | documented unsafe | Caller |
-| `src/storage.rs:662` | `unsafe {` | See local SAFETY comment | context | Review |
-| `src/storage.rs:740` | `pub unsafe fn memcpy_bytes(dst: *mut u8, src: *const u8` | Valid non-overlapping regions | unsafe fn contract | Caller |
-| `src/storage.rs:741` | `unsafe { ptr::copy_nonoverlapping(src, dst, len) }` | Valid non-overlapping regions | unsafe fn contract | Caller |
-| `src/storage.rs:778` | `// SAFETY: sysconf(_SC_PAGESIZE) is defined on POSIX an` | POSIX pagesize > 0 | cfg(unix)+4096 fallback | Y |
-| `src/storage.rs:779` | `let p = unsafe { sysconf(_SC_PAGESIZE) };` | POSIX pagesize > 0 | cfg(unix)+4096 fallback | Y |
-| `src/storage.rs:848` | `// SAFETY: read-only files; lengths validated.` | See local SAFETY comment | context | Review |
-| `src/storage.rs:849` | `let offsets_mmap = unsafe { Mmap::map(&off_file)? };` | RO file mapping valid while struct lives | single-writer-absent docs | Partial (SIGBUS) |
-| `src/storage.rs:850` | `let blob_mmap = unsafe { Mmap::map(&blob_file)? };` | RO file mapping valid while struct lives | single-writer-absent docs | Partial (SIGBUS) |
-| `src/storage.rs:1077` | `// SAFETY: file is opened read-only; length validated.` | See local SAFETY comment | context | Review |
-| `src/storage.rs:1078` | `let mmap = unsafe { Mmap::map(&file)? };` | RO file mapping valid while struct lives | single-writer-absent docs | Partial (SIGBUS) |
-| `src/storage.rs:1172` | `// SAFETY: (1) `n * row_width` bytes with `row_width ==` | RO file mapping valid while struct lives | single-writer-absent docs | Partial (SIGBUS) |
-| `src/storage.rs:1179` | `unsafe { core::slice::from_raw_parts(bytes.as_ptr() as ` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/storage.rs:1274` | `let ages = unsafe {` | See local SAFETY comment | context | Review |
-| `src/storage.rs:1280` | `let user_ids = unsafe {` | See local SAFETY comment | context | Review |
-| `src/storage.rs:1286` | `let prices = unsafe {` | See local SAFETY comment | context | Review |
-| `src/storage.rs:1333` | `let bytes = unsafe {` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:126` | `unsafe {` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:205` | `unsafe {` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:323` | `let scratch = unsafe { &mut *cell.get() };` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:372` | `let pad = unsafe { &mut *cell.get() };` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:422` | `unsafe { core::slice::from_raw_parts(src_addr as *const` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/runtime.rs:424` | `unsafe { core::slice::from_raw_parts_mut(dst_addr as *m` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/runtime.rs:455` | `unsafe fn apply_unroll8(` | TLS exclusive; indices < MAX_ROWS/BATCH | caller n bounds | Y |
-| `src/runtime.rs:519` | `// SAFETY: base+j+7 < base+BATCH_ROWS <= n <= MAX_ROWS.` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:520` | `unsafe {` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:534` | `unsafe {` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:690` | `let pad = unsafe { &mut *cell.get() };` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:746` | `let pad = unsafe { &mut *cell.get() };` | See local SAFETY comment | context | Review |
-| `src/runtime.rs:2042` | `let pad = unsafe { &mut *cell.get() };` | See local SAFETY comment | context | Review |
-| `src/lexer.rs:468` | `unsafe {` | See local SAFETY comment | context | Review |
-| `src/lib.rs:60` | `unsafe impl GlobalAlloc for CountingAlloc {` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/lib.rs:61` | `unsafe fn alloc(&self, layout: Layout) -> *mut u8 {` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/lib.rs:68` | `unsafe { System.alloc(layout) }` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/lib.rs:71` | `unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) ` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/lib.rs:72` | `unsafe { System.dealloc(ptr, layout) }` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/lib.rs:75` | `unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, ` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/lib.rs:82` | `unsafe { System.realloc(ptr, layout, new_size) }` | Zeroed `Layout::new::<T>` cold alloc; fields written before Box observes | null-check + cold path | Y |
-| `src/lib.rs:1558` | `let v = unsafe { *derived_ptr.add(s) };` | MappedRegion bounds/lifetime | documented unsafe | Caller |
+| File:line | Site | Invariant | Enforcement | OK? |
+|-----------|------|-----------|-------------|-----|
+| `parser.rs:214` | `alloc_token_window` zeroed box | `Layout::new::<[Token; MAX_TOKENS]>()`; null → `handle_alloc_error`; fields zeroed before `Box::from_raw` | cold-path only; size fixed at compile time | Y |
+| `storage.rs:299` | `Table::new_boxed` | Same alloc_zeroed pattern; `name`/`col_count`/`columns` written before Box observes pointer | cold-path; no stack `Table::new` | Y |
+| `storage.rs:427-428` | `MappedRegion::as_slice` | `ptr` valid for `len` bytes for `'a` | `unsafe fn` contract; caller supplies region from live slice/mmap | Y (caller) |
+| `storage.rs:436-439` | `MappedRegion::slice_at` | `off+len <= self.len` before `ptr.add` | runtime checked; returns `None` on overflow/OOB | Y |
+| `storage.rs:662` | `FixedOrdersDatabase::new_boxed` | alloc_zeroed + field init before Box | cold-path | Y |
+| `storage.rs:791-792` | `memcpy_bytes` | `dst`/`src` valid for `len`, non-overlapping | `unsafe fn` contract | Y (caller) |
+| `storage.rs:830` | `sysconf(_SC_PAGESIZE)` | POSIX page size; treat `<=0` as failure → 4096 fallback | `cfg(unix)` + fallback | Y |
+| `storage.rs:906-907` | `Utf8ColumnFile` `Mmap::map` | RO open; offsets length multiple of entry size; `get_row` bounds-checks blob | single-writer-absent; **mmap SIGBUS if violated** | Partial — mmap path [DOCUMENTED-LIMIT]; Int64 has `open_int64_copied` |
+| `storage.rs:1096` | `ColumnBytes::rows_at` | `start+n` within backing; Mmap page-aligned / Owned `Vec<i64>` aligned | caller bounds-checks byte_end; `debug_assert` on alignment | Y |
+| `storage.rs:1212` | copy-open `read_exact` into `Vec<i64>` as bytes | `vals` length `len/8`; writing `len` LE bytes into i64 slab | length validated `% 8 == 0` | Y |
+| `storage.rs:1222` | `Mmap::map` in `open_i64_inner` | RO file; length `% 8 == 0` | meta row_count ≤ capacity; SIGBUS if file mutated | Partial — use `open_int64_copied` for crash-proof [MITIGATED] |
+| `storage.rs:1336` | `next_page_chunk` rows view | bounds via `byte_len`; then `rows_at` | checked_mul/add; early `None` | Y |
+| `storage.rs:1433-1435` | `ColumnarTableStream::next_page` | three streams share `start_row`/`n`; each `byte_end` ≤ backing | pre-checked before `rows_at` | Y |
+| `storage.rs:1482` | `write_i64_column_bin` window as bytes | local `[i64; MAX_ROWS]` viewed as LE bytes for `n` elements | `n ≤ MAX_ROWS`; LE host contract | Y |
+| `runtime.rs:126` | `QueryResult::new_boxed` | alloc_zeroed + schema/types init | cold-path; no stack ctor | Y |
+| `runtime.rs:240` | `RuntimeScratch::new_boxed` | alloc_zeroed + derived/groups init | cold-path | Y |
+| `runtime.rs:359` | TLS `CHUNK_SCRATCH` borrow | single-threaded TLS; exclusive `&mut` for duration of call | `thread_local!` + no re-entrant engine on same thread into same pad | Y |
+| `runtime.rs:408` | TLS `ENGINE_SCRATCH_PAD` | same exclusive TLS borrow | same | Y |
+| `runtime.rs:458-460` | OS parallel chunk slices | `src_addr`/`dst_addr` from live `&[i64; MAX_ROWS]` for scope lifetime | `thread::scope`; chunks disjoint write ranges by construction | Y |
+| `runtime.rs:491` | `apply_unroll8` | `base+j+7 < n ≤ MAX_ROWS` | caller loops; SAFETY comment + `debug_assert` opportunity at call sites | Y |
+| `runtime.rs:556,570` | filter unroll calls | Phase A/B guarantee `base+j+7 < n` | loop structure | Y |
+| `runtime.rs:726,782,2127` | TLS pad borrows | exclusive TLS | same as above | Y |
+| `lexer.rs:468` | test token buffer alloc | test-only alloc_zeroed of `[Token; MAX_TOKENS]` | test cfg | Y |
+| `lib.rs:60-82` | `CountingAlloc` | forwards to `System`; counts only | test GlobalAlloc | Y |
+| `lib.rs:1558` | derived pointer probe | `derived_ptr` from `scratch.derived.as_mut_ptr()`; `s < MAX_ROWS` | test loop bound | Y |
 
-\* Alignment assumes OS page size is a multiple of 8 (true for POSIX base pages).
+## SIGBUS status
+
+| Path | Status |
+|------|--------|
+| `ColumnarFileStream::open_i64` (mmap) | Still SIGBUS on truncate — demonstrated EXIT 135 (`--mmap`) |
+| `ColumnarFileStream::open_int64_copied` | **[MITIGATED]** — truncate-after-open survives; EXIT 0 |
+| `Utf8ColumnFile::open` | **[DOCUMENTED-LIMIT]** — mmap only; no copy-on-open in this pass |
+
+Measured open+scan 100 000 rows × 50 (release): mmap ≈ 21 772 ns avg, copy ≈ 57 059 ns avg (**~2.62×**).

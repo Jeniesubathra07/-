@@ -1080,7 +1080,15 @@ impl<'a> Engine<'a> {
             while c < nproj {
                 let side = col_side[c];
                 if side == 2 {
-                    out.int_out[c].values[out_row] = scratch.derived[slot];
+                    // After `தொகுப்பு`/`சுருக்கு`, `derived[i]` is dense by output
+                    // order index. After `கணி`, `derived[slot]` is keyed by source
+                    // / join slot (what `order[oi]` holds).
+                    let di = if scratch.groups.len as usize == order_len && order_len > 0 {
+                        oi
+                    } else {
+                        slot
+                    };
+                    out.int_out[c].values[out_row] = scratch.derived[di];
                     out.int_out[c].validity.set(out_row, true);
                     c += 1;
                     continue;
@@ -1554,8 +1562,12 @@ impl<'a> Engine<'a> {
             out.col_count = 1;
             let mut r = 0usize;
             while r < order_len && r < MAX_ROWS {
-                let slot = scratch.order[r] as usize;
-                out.int_out[0].values[r] = scratch.derived[slot];
+                let di = if scratch.groups.len as usize == order_len {
+                    r
+                } else {
+                    scratch.order[r] as usize
+                };
+                out.int_out[0].values[r] = scratch.derived[di];
                 out.int_out[0].validity.set(r, true);
                 r += 1;
             }
@@ -1734,29 +1746,42 @@ impl<'a> Engine<'a> {
         }
         lsd_radix_sort_ages(&scratch.key_buf, &mut scratch.left_order, n, &mut scratch.tmp_u16);
 
-        // Collapse equal-key runs; record counts into derived[group].
+        // Collapse equal-key runs; accumulate count/sum/min/max per run member
+        // (not key*count after the fact) so multi-row groups exercise the
+        // accumulator path that size-1 fixtures never hit.
         let mut out_n = 0usize;
         let mut run = 0usize;
         while run < n {
             let dense0 = scratch.left_order[run] as usize;
             let key0 = scratch.key_buf[dense0];
+            let mut count = 1i64;
+            let mut sum = key0;
+            let mut mn = key0;
+            let mut mx = key0;
             let mut end = run + 1;
             while end < n {
                 let d = scratch.left_order[end] as usize;
-                if scratch.key_buf[d] != key0 {
+                let k = scratch.key_buf[d];
+                if k != key0 {
                     break;
+                }
+                count += 1;
+                sum = sum.wrapping_add(k);
+                if k < mn {
+                    mn = k;
+                }
+                if k > mx {
+                    mx = k;
                 }
                 end += 1;
             }
-            let count = (end - run) as i64;
             let rep_dense = scratch.left_order[run] as usize;
             scratch.tmp_u16[out_n] = scratch.order[rep_dense];
-            // Group-key aggregates are exact: every member shares `key0`.
             scratch.groups.keys[out_n] = key0;
             scratch.groups.count[out_n] = count;
-            scratch.groups.sum[out_n] = key0.wrapping_mul(count);
-            scratch.groups.min[out_n] = key0;
-            scratch.groups.max[out_n] = key0;
+            scratch.groups.sum[out_n] = sum;
+            scratch.groups.min[out_n] = mn;
+            scratch.groups.max[out_n] = mx;
             scratch.left_dense[out_n] = key0;
             scratch.derived[out_n] = count;
             out_n += 1;
