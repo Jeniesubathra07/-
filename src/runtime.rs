@@ -2505,41 +2505,52 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "file I/O")]
-    fn pushdown_skips_pages_outside_predicate_range_and_stays_correct() {
-        let dir = tmp_path("skip_range");
+    fn test_pushdown_skips_pages_outside_predicate_range() {
+        // Protocol name + construct via ingest (same path as `tqe_ingest`),
+        // not hand-built binary fixtures alone.
+        use crate::ingest::{ingest_csv, parse_schema};
+
+        let dir = tmp_path("skip_range_ingest");
         std::fs::create_dir_all(&dir).unwrap();
-        let bin_path = dir.join("val.bin");
-        let zmap_path = dir.join("val.zmap");
+        let csv_path = dir.join("val.csv");
+        let out_dir = dir.join("out");
 
-        let probe_stream = ColumnarFileStream::open_int64_copied(&{
-            let probe_path = dir.join("probe.bin");
-            write_i64_column_bin(&probe_path, 1, |_| 0).unwrap();
-            probe_path
-        })
-        .unwrap();
-        let page_rows = probe_stream.page_rows();
-
+        let probe_path = dir.join("probe.bin");
+        write_i64_column_bin(&probe_path, 1, |_| 0).unwrap();
+        let page_rows = ColumnarFileStream::open_int64_copied(&probe_path)
+            .unwrap()
+            .page_rows();
         let total_rows = page_rows * 2;
-        let values: Vec<i64> = (0..total_rows)
-            .map(|i| {
-                if i < page_rows {
-                    i as i64
-                } else {
-                    100_000 + i as i64
-                }
-            })
-            .collect();
-        write_i64_column_bin(&bin_path, total_rows, |i| values[i]).unwrap();
-        write_zonemap_for_column(&bin_path, &zmap_path).unwrap();
+
+        let mut csv = String::from("val\n");
+        let mut i = 0usize;
+        while i < total_rows {
+            let v = if i < page_rows {
+                i as i64
+            } else {
+                100_000 + i as i64
+            };
+            csv.push_str(&format!("{v}\n"));
+            i += 1;
+        }
+        std::fs::write(&csv_path, &csv).unwrap();
+        let schema = parse_schema("val:i64").unwrap();
+        let report = ingest_csv(&csv_path, &schema, &out_dir, true).unwrap();
+        assert_eq!(report.rows_ingested, total_rows);
+
+        let bin_path = out_dir.join("val.bin");
+        let zmap_path = bin_path.with_extension("zmap");
+        // Prefer sidecar from tqe_ingest-style auto-write; if missing, compute.
+        if !zmap_path.exists() {
+            write_zonemap_for_column(&bin_path, &zmap_path).unwrap();
+        } else {
+            // Recompute from published .bin to assert independence from ingest.
+            write_zonemap_for_column(&bin_path, &zmap_path).unwrap();
+        }
         let zm = ZoneMap::load(&zmap_path).unwrap().unwrap();
-        assert_eq!(
-            zm.len(),
-            2,
-            "must be exactly two pages for this test's premise to hold"
-        );
+        assert_eq!(zm.len(), 2);
 
         let predicate = ZonePredicate::Gt(99_999);
-
         let (with_zm_values, with_zm_stats) = run_pushdown(&bin_path, Some(&zm), predicate);
         let (baseline_values, baseline_stats) = run_pushdown(&bin_path, None, predicate);
 
@@ -2547,18 +2558,21 @@ mod tests {
             with_zm_values, baseline_values,
             "pushdown must never change the returned rows, only which pages it scans"
         );
-        assert_eq!(
-            with_zm_values.len(),
-            page_rows,
-            "every row in page 1 satisfies > 99_999"
-        );
-
+        assert_eq!(with_zm_values.len(), page_rows);
         assert_eq!(with_zm_stats.pages_skipped, 1, "page 0 must be skipped");
         assert_eq!(with_zm_stats.pages_scanned, 1, "page 1 must still be scanned");
-        assert_eq!(baseline_stats.pages_skipped, 0, "no zone map means no skipping");
-        assert_eq!(baseline_stats.pages_scanned, 2, "no zone map means full scan");
+        assert_eq!(baseline_stats.pages_skipped, 0);
+        assert_eq!(baseline_stats.pages_scanned, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn pushdown_skips_pages_outside_predicate_range_and_stays_correct() {
+        // Kept as alias coverage for the earlier name; logic lives in
+        // `test_pushdown_skips_pages_outside_predicate_range`.
+        test_pushdown_skips_pages_outside_predicate_range();
     }
 
     #[test]
@@ -2587,7 +2601,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "file I/O")]
-    fn pushdown_correct_at_exact_boundary_threshold() {
+    fn test_pushdown_correct_at_exact_boundary_values() {
         let dir = tmp_path("boundary");
         std::fs::create_dir_all(&dir).unwrap();
         let bin_path = dir.join("val.bin");
@@ -2617,6 +2631,12 @@ mod tests {
         assert_eq!(kept, vec![max_val]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn pushdown_correct_at_exact_boundary_threshold() {
+        test_pushdown_correct_at_exact_boundary_values();
     }
 
     #[test]

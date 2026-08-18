@@ -5,10 +5,11 @@
 Phase 0/1 intact. Representative `cargo test --release --lib` after Phase 2:
 
 ```
-test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 88 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 ```
 
-(Prior Phase 1 baseline was 77; Phase 2 adds zonemap + pushdown coverage → **86**.)
+(Prior Phase 1 baseline was 77; Phase 2 adds zonemap + pushdown coverage.
+Exact count depends on alias tests for protocol names.)
 
 `overflow-checks = true` remains set in `[profile.release]`.
 
@@ -33,7 +34,8 @@ query-open after the cold `File::read_exact` loop.
 `write_zonemap_for_column(bin_path, zmap_path)` streams the published `.bin`
 via `ColumnarFileStream::open_int64_copied` (does not re-read CSV). Meta path
 is not a separate argument — row count comes from the `.bin` (+ companion
-`.meta` when present via the normal open path).
+`.meta` when present via the normal open path). Diverged from the protocol
+sketch `(bin, meta, zmap)` deliberately: open already validates meta.
 
 `tqe_ingest` auto-writes `.zmap` for every Int64 column after successful
 publish; Utf8 columns are skipped (no stub).
@@ -41,7 +43,7 @@ publish; Utf8 columns are skipped (no stub).
 ## Pushdown
 
 - `ZonePredicate::{Gt, Lt, Eq}` — matches lexer tokens (`>`, `<`, `=`). No
-  `>=` / `<=` / `!=` in the grammar.
+  `>=` / `<=` / `!=` in the grammar (confirmed against `TokenKind`).
 - `execute_mmap_i64_filter_stream_pushdown` consults the map once-loaded;
   impossible pages are not decoded into scratch pads.
 - Missing `.zmap` → full scan; `PushdownStats.pages_skipped == 0`.
@@ -50,12 +52,12 @@ publish; Utf8 columns are skipped (no stub).
 
 ## Tests proving skip + correctness
 
-| Protocol name | Implemented as |
-|---------------|----------------|
-| multipage min/max vs raw data | `zonemap::tests::zonemap_written_correctly_for_multipage_column` (+ e2e twin) |
-| skip + identical result set | `runtime::tests::pushdown_skips_pages_outside_predicate_range_and_stays_correct` |
-| boundary min/max | `runtime::tests::pushdown_correct_at_exact_boundary_threshold` + `zonemap::tests::predicate_boundary_values_are_correct_not_off_by_one` |
-| demo no-zmap fallback | `test_pushdown_falls_back_cleanly_without_zonemap` (e2e + runtime) |
+| Protocol name | Status |
+|---------------|--------|
+| `test_zonemap_written_correctly_for_multipage_column` | e2e + `zonemap::tests::zonemap_written_correctly_for_multipage_column` |
+| `test_pushdown_skips_pages_outside_predicate_range` | via `ingest_csv` (tqe_ingest path); asserts skip==1 AND identical row set vs full scan |
+| `test_pushdown_correct_at_exact_boundary_values` | page not skipped when threshold == max−1; skipped when threshold == max for `>` |
+| `test_pushdown_falls_back_cleanly_without_zonemap` | demo catalog + mmap without `.zmap` |
 
 ## Benchmark (real numbers)
 
@@ -65,17 +67,17 @@ Command:
 cargo run --release --bin zonemap_bench
 ```
 
-Output (200 000 rows, 20 iters, release, this environment):
+Output (200 000 rows, release, this environment — re-measured):
 
 ```
-clustered (monotonic id column): full_scan=166418ns (pages_scanned=391/391) pushdown=2827ns (pages_scanned=5/391, skipped=386) speedup=58.867x
-random (uniform 0..1_000_000): full_scan=163868ns (pages_scanned=391/391) pushdown=165321ns (pages_scanned=391/391, skipped=0) speedup=0.991x
+clustered (monotonic id column): full_scan=158079ns (pages_scanned=391/391) pushdown=2669ns (pages_scanned=5/391, skipped=386) speedup=59.228x
+random (uniform 0..1_000_000): full_scan=158858ns (pages_scanned=391/391) pushdown=161371ns (pages_scanned=391/391, skipped=0) speedup=0.984x
 ```
 
-**Finding:** On clustered/monotonic data, pushdown is ~59×. On uniform random
-data with a mid-domain filter, **0 pages skipped** and wall-clock is
-noise-level slower (~0.99×) — the zone-map consult cost with no skips. That
-is reported honestly, not hidden.
+**Finding:** On clustered/monotonic data, pushdown is **~59×** with 386/391
+pages skipped. On uniform random data with a mid-domain filter, **0 pages
+skipped** and wall-clock is noise-level slower (~0.98×) — the zone-map
+consult cost with no skips. Reported honestly.
 
 ## Deferred (out of scope this phase)
 
