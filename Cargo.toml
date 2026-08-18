@@ -32,6 +32,10 @@ path = "src/bin/audit_fuzz_driver.rs"
 name = "tqe_ingest"
 path = "src/bin/tqe_ingest.rs"
 
+[[bin]]
+name = "zonemap_bench"
+path = "src/bin/zonemap_bench.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

@@ -10,6 +10,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process;
 use tamil_query_engine::ingest::{ingest_csv, parse_schema};
+use tamil_query_engine::zonemap::write_zonemap_for_column;
 
 fn print_usage_and_exit(msg: Option<&str>) -> ! {
     if let Some(m) = msg {
@@ -75,6 +76,31 @@ fn main() {
                 report.columns_written.len(),
                 out_dir.display()
             );
+
+            // Phase 2: compute a zone-map sidecar for every Int64 column
+            // right after it's published. Utf8 columns are skipped.
+            use tamil_query_engine::ingest::ColumnType;
+            for (spec, path) in schema.columns.iter().zip(report.columns_written.iter()) {
+                if spec.ty != ColumnType::Int64 {
+                    continue;
+                }
+                let zmap_path = path.with_extension("zmap");
+                match write_zonemap_for_column(path, &zmap_path) {
+                    Ok(pages) => {
+                        eprintln!(
+                            "  zone map: {} ({} pages)",
+                            zmap_path.display(),
+                            pages
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  warning: zone map for '{}' failed: {e:?} (queries will fall back to full scan for this column)",
+                            spec.name
+                        );
+                    }
+                }
+            }
         }
         Err(e) => {
             eprintln!("error: {e}");

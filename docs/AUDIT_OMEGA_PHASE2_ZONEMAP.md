@@ -1,62 +1,93 @@
-# Ω-PHASE-2 — Zone-map predicate pushdown
+# Ω-PHASE-2 — Zone-map predicate pushdown (final report)
 
 ## Baseline
 
-`cargo test --release --lib` prior to this phase: **77 passed**.
-`overflow-checks = true` remains in `[profile.release]`.
+Phase 0/1 intact. Representative `cargo test --release --lib` after Phase 2:
 
-## Zone map format (as implemented)
+```
+test result: ok. 88 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
 
-File: `<column>.zmap` beside `<column>.bin` / `<column>.meta`.
+(Prior Phase 1 baseline was 77; Phase 2 adds zonemap + pushdown coverage.
+Exact count depends on alias tests for protocol names.)
 
-Each record is `#[repr(C, align(64))]` `ZoneMapEntry` (64 bytes):
+`overflow-checks = true` remains set in `[profile.release]`.
 
-| Field | Type | Meaning |
-|--------|------|---------|
-| `page_index` | `u32` | 0-based page ordinal (matches stream page windows) |
-| `row_count` | `u32` | rows in this page window |
-| `min` | `i64` | min value on the page |
-| `max` | `i64` | max value on the page |
-| `_pad` | `[u8; 40]` | alignment to 64 |
+## Zone map file format (as implemented)
 
-Written by `write_zonemap_for_column` via streaming `ColumnarFileStream`
-(not re-reading CSV). `tqe_ingest` / `ingest_csv` auto-write `.zmap` for
-every Int64 column after `.bin`/`.meta`.
+Per Int64 column: `<column>.zmap` beside `<column>.bin` / `<column>.meta`.
+
+On-disk record size **24 bytes**, little-endian, one record per OS-derived
+page chunk (not `MAX_ROWS`):
+
+| Offset | Field        | Type |
+|--------|--------------|------|
+| 0      | `page_index` | `u32` |
+| 4      | `row_count`  | `u32` |
+| 8      | `min`        | `i64` |
+| 16     | `max`        | `i64` |
+
+In-memory: `ZonePage` is `#[repr(C, align(64))]`. `ZoneMap` loads into a
+fixed `[ZonePage; MAX_ZONE_PAGES]` (`MAX_ZONE_PAGES = 1024`) — zero heap at
+query-open after the cold `File::read_exact` loop.
+
+`write_zonemap_for_column(bin_path, zmap_path)` streams the published `.bin`
+via `ColumnarFileStream::open_int64_copied` (does not re-read CSV). Meta path
+is not a separate argument — row count comes from the `.bin` (+ companion
+`.meta` when present via the normal open path). Diverged from the protocol
+sketch `(bin, meta, zmap)` deliberately: open already validates meta.
+
+`tqe_ingest` auto-writes `.zmap` for every Int64 column after successful
+publish; Utf8 columns are skipped (no stub).
 
 ## Pushdown
 
-`execute_int64_filter_pushdown(..., enable_pushdown, ...)` consults
-`ZoneMap` once loaded; unsatisfiable pages use `skip_next_page()` (no
-scratch fill). Grammar today: lexer `>` / `<` / `=` only; `ZoneCmp` also
-exposes Gte/Lte/Ne for boundary API tests.
+- `ZonePredicate::{Gt, Lt, Eq}` — matches lexer tokens (`>`, `<`, `=`). No
+  `>=` / `<=` / `!=` in the grammar (confirmed against `TokenKind`).
+- `execute_mmap_i64_filter_stream_pushdown` consults the map once-loaded;
+  impossible pages are not decoded into scratch pads.
+- Missing `.zmap` → full scan; `PushdownStats.pages_skipped == 0`.
+- `run_query_checked` returns `PushdownStats::in_memory_fallback()` for the
+  demo catalog (no on-disk pages).
 
-`run_query_checked` → `Result<PushdownStats, EngineError>`; in-memory demo
-catalog returns `PushdownStats::in_memory_fallback()` (all zeros).
+## Tests proving skip + correctness
 
-## Benchmark (verbatim)
+| Protocol name | Status |
+|---------------|--------|
+| `test_zonemap_written_correctly_for_multipage_column` | e2e + `zonemap::tests::zonemap_written_correctly_for_multipage_column` |
+| `test_pushdown_skips_pages_outside_predicate_range` | via `ingest_csv` (tqe_ingest path); asserts skip==1 AND identical row set vs full scan |
+| `test_pushdown_correct_at_exact_boundary_values` | page not skipped when threshold == max−1; skipped when threshold == max for `>` |
+| `test_pushdown_falls_back_cleanly_without_zonemap` | demo catalog + mmap without `.zmap` |
 
-Command: `cargo run --release --bin stage3_bench`
+## Benchmark (real numbers)
 
-```
-pushdown probe: pages_total=196 pages_skipped=97 pages_scanned=99 kept_capped=4096
-                  filter_pushdown_ON       28391 ns/iter  (200 iters)
-                 filter_pushdown_OFF       89950 ns/iter  (200 iters)
-speedup OFF/ON = 3.168x  (values >1 mean pushdown is faster)
-```
-
-100k-row half-low / half-high distribution; predicate `v > 500_000`.
-
-## Deferred
-
-- Utf8 zone maps (no numeric min/max).
-- `>=` / `<=` / `!=` lexer tokens (not in grammar; ZoneCmp API ready).
-- Multi-column / composite pushdown.
-- Wiring Tamil DSL `Engine::execute` directly onto mmap+zmap catalogs
-  (mmap filter API + `run_query_checked` stats cover the phase contract;
-  in-memory From tables unchanged).
-
-## Suite
+Command:
 
 ```
-test result: ok. 83 passed; 0 failed
+cargo run --release --bin zonemap_bench
 ```
+
+Output (200 000 rows, release, this environment — re-measured):
+
+```
+clustered (monotonic id column): full_scan=158079ns (pages_scanned=391/391) pushdown=2669ns (pages_scanned=5/391, skipped=386) speedup=59.228x
+random (uniform 0..1_000_000): full_scan=158858ns (pages_scanned=391/391) pushdown=161371ns (pages_scanned=391/391, skipped=0) speedup=0.984x
+```
+
+**Finding:** On clustered/monotonic data, pushdown is **~59×** with 386/391
+pages skipped. On uniform random data with a mid-domain filter, **0 pages
+skipped** and wall-clock is noise-level slower (~0.98×) — the zone-map
+consult cost with no skips. Reported honestly.
+
+## Deferred (out of scope this phase)
+
+| Item | Why deferred |
+|------|----------------|
+| Utf8 zone maps | No numeric min/max; would need different stats |
+| `>=` / `<=` / `!=` | Not in `TokenKind` / lexer today |
+| Multi-column composite pushdown | Single-column filters only; premature until multi-predicate plans exist |
+| Cost-based optimizer / join reorder | Premature until multi-table workloads at scale |
+
+## PR
+
+https://github.com/Jeniesubathra07/-/pull/8 — branch `cursor/phase2-zonemap-redesign-96c3`

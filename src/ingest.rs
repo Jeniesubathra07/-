@@ -43,7 +43,6 @@
 //!   guaranteed, rather than implying a stronger guarantee than exists.
 
 use crate::storage::{write_i64_column_bin, write_utf8_column_files};
-use crate::zonemap::write_zonemap_for_column;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -383,9 +382,6 @@ pub fn ingest_csv(
                 let bin_path = out_dir.join(format!("{}.bin", spec.name));
                 let data = &int_cols[c];
                 write_i64_column_bin(&bin_path, data.len(), |i| data[i])?;
-                let meta_path = bin_path.with_extension("meta");
-                let zmap_path = bin_path.with_extension("zmap");
-                write_zonemap_for_column(&bin_path, &meta_path, &zmap_path)?;
                 columns_written.push(bin_path);
             }
             ColumnType::Utf8 => {
