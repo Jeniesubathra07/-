@@ -1800,6 +1800,32 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "file I/O")]
     fn write_int64_permission_denied_clean() {
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn geteuid() -> u32;
+            }
+            // SAFETY: geteuid() is a pure POSIX libc query with no
+            // preconditions and no side effects; always safe to call.
+            // Declared directly via FFI rather than depending on the
+            // `libc` crate, which is not a dependency of this crate.
+            if unsafe { geteuid() } == 0 {
+                // Root bypasses Unix DAC permission bits (CAP_DAC_OVERRIDE)
+                // on virtually all filesystems, so a 0o555 directory does
+                // not actually block a write from a root-owned process.
+                // This is not a hypothetical: this exact sandbox, and many
+                // CI/container runners, execute test suites as uid 0 by
+                // default. Asserting permission-denied semantics under
+                // root would make this test flaky/environment-dependent
+                // rather than deterministic, so it is skipped instead of
+                // silently passing or failing depending on who runs it.
+                eprintln!(
+                    "write_int64_permission_denied_clean: skipped (running as root, \
+                     which bypasses Unix permission bits)"
+                );
+                return;
+            }
+        }
         let dir = std::env::temp_dir().join("tamil_write_perm_denied");
         let _ = std::fs::create_dir_all(&dir);
         let readonly = dir.join("ro");
@@ -1820,7 +1846,6 @@ mod tests {
         let err = write_i64_column_bin(&path, 8, |i| i as i64).unwrap_err();
         assert!(
             err.kind() == std::io::ErrorKind::PermissionDenied
-                || err.kind() == std::io::ErrorKind::ReadOnlyFilesystem
                 || err.raw_os_error() == Some(13)
                 || err.raw_os_error() == Some(30),
             "expected permission error, got {err:?}"
@@ -1855,7 +1880,7 @@ mod tests {
         let buf = [1u8; 4096];
         let err = f.write_all(&buf).unwrap_err();
         assert!(
-            err.raw_os_error() == Some(28) || err.kind() == std::io::ErrorKind::StorageFull,
+            err.raw_os_error() == Some(28),
             "expected ENOSPC from /dev/full, got {err:?}"
         );
     }

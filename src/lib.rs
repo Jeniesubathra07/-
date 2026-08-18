@@ -2,6 +2,7 @@
 //! and columnar database.
 //!
 //! # Architecture
+//! - [`ingest`] — CSV → columnar `.bin`/`.meta` cold-path pipeline
 //! - [`lexer`] — zero-allocation UTF-8 / Tamil DSL scanner
 //! - [`parser`] — flat arena AST (`u32` index links, no pointer trees)
 //! - [`storage`] — Arrow-aligned columnar segments
@@ -12,6 +13,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+pub mod ingest;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
