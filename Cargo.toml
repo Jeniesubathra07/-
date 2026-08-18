@@ -28,6 +28,10 @@ path = "src/bin/sigbus_mmap_hazard.rs"
 name = "audit_fuzz_driver"
 path = "src/bin/audit_fuzz_driver.rs"
 
+[[bin]]
+name = "tqe_ingest"
+path = "src/bin/tqe_ingest.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
