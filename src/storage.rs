@@ -1304,6 +1304,23 @@ impl ColumnarFileStream {
         self.cursor_row = 0;
     }
 
+    /// Advance past one page window without decoding rows (pushdown skip).
+    #[inline(always)]
+    pub fn skip_next_page(&mut self) -> Option<u32> {
+        if self.cursor_row >= self.total_rows {
+            return None;
+        }
+        let remaining = self.total_rows - self.cursor_row;
+        let n = remaining.min(self.page_rows);
+        let page_index = if self.page_rows == 0 {
+            0
+        } else {
+            (self.cursor_row / self.page_rows) as u32
+        };
+        self.cursor_row = self.cursor_row.wrapping_add(n);
+        Some(page_index)
+    }
+
     /// Advance `cursor_row` by `page_rows` (or the remainder) and return a
     /// borrowed slice view over the backing bytes (mmap or owned copy).
     ///
