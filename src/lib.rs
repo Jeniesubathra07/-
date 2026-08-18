@@ -3,6 +3,7 @@
 //!
 //! # Architecture
 //! - [`ingest`] — CSV → columnar `.bin`/`.meta` cold-path pipeline
+//! - [`zonemap`] — Int64 `.zmap` sidecars for page-level predicate pushdown
 //! - [`lexer`] — zero-allocation UTF-8 / Tamil DSL scanner
 //! - [`parser`] — flat arena AST (`u32` index links, no pointer trees)
 //! - [`storage`] — Arrow-aligned columnar segments
@@ -19,13 +20,16 @@ pub mod parser;
 pub mod runtime;
 pub mod storage;
 pub mod utf8;
+pub mod zonemap;
 
 pub use lexer::{Lexer, LexerError, Token, TokenKind, MAX_TOKENS};
 pub use runtime::{
     demo_catalog, execute_chunk_parallel, execute_chunk_parallel_os,
-    execute_mmap_age_filter_stream, execute_mmap_table_filter_project_stream, lsd_radix_sort_ages,
-    lsd_radix_sort_ages_tls, run_query, run_query_checked, vector_merge_join, ArithOp, ChunkScratch, Engine,
-    EngineError, EngineScratchPad, GroupedAgg, MmapStreamStats, QueryResult, RadixScratchPad, RuntimeScratch,
+    execute_int64_filter_pushdown, execute_mmap_age_filter_stream,
+    execute_mmap_table_filter_project_stream, lsd_radix_sort_ages, lsd_radix_sort_ages_tls,
+    run_query, run_query_checked, vector_merge_join, ArithOp, ChunkScratch, Engine, EngineError,
+    EngineScratchPad, GroupedAgg, MmapStreamStats, PushdownStats, QueryResult, RadixScratchPad,
+    RuntimeScratch,
 };
 pub use storage::{
     dup_price_orders_catalog, os_page_size_bytes, seed_dup_price_orders_table, seed_orders_database,
@@ -35,8 +39,12 @@ pub use storage::{
     Int64ColumnMeta, PhysType, SelectionVector, Table, Utf8Column, Utf8ColumnFile, Utf8ColumnMeta,
     Utf8OffsetEntry, BATCH_ROWS, MAX_ROWS, NAME_CAP,
 };
+pub use zonemap::{
+    page_can_satisfy, write_zonemap_for_column, ZoneCmp, ZoneMap, ZoneMapEntry, MAX_ZMAP_PAGES,
+};
 pub use parser::{
-    alloc_token_window, parse_query, AstArena, AstNode, NodeKind, OpKind, ParseError, Parser, ParserError, AST_CAP, NIL,
+    alloc_token_window, parse_query, AstArena, AstNode, NodeKind, OpKind, ParseError, Parser,
+    ParserError, AST_CAP, NIL,
 };
 
 /// Canonical end-to-end demo query from the system specification.
@@ -2060,5 +2068,261 @@ mod e2e_tests {
         assert!(copied.is_copied());
         assert_eq!(copied.total_rows(), 0);
         assert!(copied.next_page_chunk().is_none());
+    }
+
+    /// Zone map min/max for a 12k-row multipage column, checked against
+    /// independently computed page ranges from the raw generator (not from .zmap).
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn test_zonemap_written_correctly_for_multipage_column() {
+        use crate::ingest::{ingest_csv, parse_schema};
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tqe_zmap_multipage_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("orders.csv");
+        let n = 12_000i64;
+        let mut csv = String::from("price\n");
+        let mut raw: Vec<i64> = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let price = 100 + (i % 900);
+            raw.push(price);
+            csv.push_str(&format!("{price}\n"));
+        }
+        fs::write(&csv_path, &csv).unwrap();
+        let schema = parse_schema("price:i64").unwrap();
+        let out_dir = dir.join("out");
+        let report = ingest_csv(&csv_path, &schema, &out_dir, true).unwrap();
+        assert_eq!(report.rows_ingested, n as usize);
+
+        let bin = out_dir.join("price.bin");
+        let zmap_path = bin.with_extension("zmap");
+        assert!(zmap_path.exists(), ".zmap must be written by ingest");
+        let zm = ZoneMap::open(&zmap_path).unwrap();
+
+        let page_rows = os_page_size_bytes() / 8;
+        let expected_pages = ((n as usize) + page_rows - 1) / page_rows;
+        assert_eq!(zm.page_count() as usize, expected_pages);
+
+        let mut p = 0usize;
+        while p < expected_pages {
+            let start = p * page_rows;
+            let end = ((p + 1) * page_rows).min(n as usize);
+            let mut mn = i64::MAX;
+            let mut mx = i64::MIN;
+            let mut i = start;
+            while i < end {
+                if raw[i] < mn {
+                    mn = raw[i];
+                }
+                if raw[i] > mx {
+                    mx = raw[i];
+                }
+                i += 1;
+            }
+            let e = zm.entry(p).expect("entry");
+            assert_eq!(e.page_index, p as u32);
+            assert_eq!(e.row_count as usize, end - start);
+            assert_eq!(e.min, mn, "page {p} min");
+            assert_eq!(e.max, mx, "page {p} max");
+            p += 1;
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Disjoint page ranges: pushdown must skip page 0 and keep correctness.
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn test_pushdown_skips_pages_outside_predicate_range() {
+        use crate::ingest::{ingest_csv, parse_schema};
+        use std::fs;
+
+        let page_rows = os_page_size_bytes() / 8;
+        let dir = std::env::temp_dir().join(format!(
+            "tqe_pushdown_skip_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("vals.csv");
+        let mut csv = String::from("v\n");
+        // Page 0: 0..999; page 1: 100_000+
+        let mut i = 0usize;
+        while i < page_rows {
+            let v = (i % 1000) as i64;
+            csv.push_str(&format!("{v}\n"));
+            i += 1;
+        }
+        let mut i = 0usize;
+        while i < page_rows {
+            let v = 100_000 + (i as i64);
+            csv.push_str(&format!("{v}\n"));
+            i += 1;
+        }
+        fs::write(&csv_path, &csv).unwrap();
+        let schema = parse_schema("v:i64").unwrap();
+        let out_dir = dir.join("out");
+        ingest_csv(&csv_path, &schema, &out_dir, true).unwrap();
+
+        let bin = out_dir.join("v.bin");
+        let meta = bin.with_extension("meta");
+        let zmap_path = bin.with_extension("zmap");
+        let mut stream = ColumnarFileStream::open_i64_with_meta(&bin, &meta).unwrap();
+        let zmap = ZoneMap::open(&zmap_path).unwrap();
+        assert!(zmap.page_count() >= 2);
+
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut out_on = vec![0i64; MAX_ROWS];
+        let mut out_off = vec![0i64; MAX_ROWS];
+        let mut len_on = 0usize;
+        let mut len_off = 0usize;
+        let mut stats_on = PushdownStats::default();
+        let mut stats_off = PushdownStats::default();
+
+        // Predicate only page 1 can satisfy: v > 50_000
+        execute_int64_filter_pushdown(
+            &mut stream,
+            Some(&zmap),
+            ZoneCmp::Gt,
+            50_000,
+            true,
+            &mut scratch,
+            &mut out_on,
+            &mut len_on,
+            &mut stats_on,
+        );
+        stream.rewind();
+        execute_int64_filter_pushdown(
+            &mut stream,
+            Some(&zmap),
+            ZoneCmp::Gt,
+            50_000,
+            false,
+            &mut scratch,
+            &mut out_off,
+            &mut len_off,
+            &mut stats_off,
+        );
+
+        assert_eq!(
+            stats_on.pages_skipped, 1,
+            "page 0 [0..999] must be skipped for > 50000; stats={stats_on:?}"
+        );
+        assert_eq!(stats_on.pages_scanned, 1);
+        assert_eq!(stats_off.pages_skipped, 0);
+        assert_eq!(stats_off.pages_scanned, 2);
+        assert_eq!(len_on, len_off, "pushdown must not change result cardinality");
+        assert_eq!(&out_on[..len_on], &out_off[..len_off]);
+        assert_eq!(len_on, page_rows);
+        assert!(out_on[..len_on].iter().all(|&v| v > 50_000));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Threshold exactly equal to a page max: Gt must skip; Gte must not.
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn test_pushdown_correct_at_exact_boundary_values() {
+        use crate::ingest::{ingest_csv, parse_schema};
+        use std::fs;
+
+        let page_rows = os_page_size_bytes() / 8;
+        let dir = std::env::temp_dir().join(format!(
+            "tqe_pushdown_bound_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("vals.csv");
+        let mut csv = String::from("v\n");
+        // Page 0: all values == 10 (min=max=10). Page 1: all 200.
+        let mut i = 0usize;
+        while i < page_rows {
+            csv.push_str("10\n");
+            i += 1;
+        }
+        let mut i = 0usize;
+        while i < page_rows {
+            csv.push_str("200\n");
+            i += 1;
+        }
+        fs::write(&csv_path, &csv).unwrap();
+        ingest_csv(&csv_path, &parse_schema("v:i64").unwrap(), &dir.join("out"), true).unwrap();
+        let bin = dir.join("out/v.bin");
+        let mut stream = ColumnarFileStream::open_i64_with_meta(&bin, &bin.with_extension("meta")).unwrap();
+        let zmap = ZoneMap::open(&bin.with_extension("zmap")).unwrap();
+        let e0 = zmap.entry(0).unwrap();
+        assert_eq!(e0.min, 10);
+        assert_eq!(e0.max, 10);
+
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut out = vec![0i64; MAX_ROWS];
+        let mut len = 0usize;
+        let mut stats = PushdownStats::default();
+
+        // Gt 10: page 0 max==10 cannot satisfy → skip.
+        execute_int64_filter_pushdown(
+            &mut stream,
+            Some(&zmap),
+            ZoneCmp::Gt,
+            10,
+            true,
+            &mut scratch,
+            &mut out,
+            &mut len,
+            &mut stats,
+        );
+        assert_eq!(stats.pages_skipped, 1);
+        assert_eq!(len, page_rows);
+        assert!(out[..len].iter().all(|&v| v > 10));
+
+        // Gte 10: page 0 MUST be scanned (boundary value satisfies).
+        stream.rewind();
+        len = 0;
+        stats = PushdownStats::default();
+        execute_int64_filter_pushdown(
+            &mut stream,
+            Some(&zmap),
+            ZoneCmp::Gte,
+            10,
+            true,
+            &mut scratch,
+            &mut out,
+            &mut len,
+            &mut stats,
+        );
+        assert_eq!(
+            stats.pages_skipped, 0,
+            "exact min/max boundary must not skip under Gte; {stats:?}"
+        );
+        assert_eq!(stats.pages_scanned, 2);
+        assert_eq!(len, page_rows * 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Demo catalog has no `.zmap` — pushdown is a no-op fallback.
+    #[test]
+    fn test_pushdown_falls_back_cleanly_without_zonemap() {
+        let catalog = demo_catalog();
+        let mut arena = Box::new(AstArena::new());
+        let mut out = QueryResult::new_boxed();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut tokens = alloc_token_window();
+        let stats = run_query_checked(
+            DEMO_QUERY,
+            &catalog,
+            &mut arena,
+            &mut out,
+            &mut scratch,
+            &mut tokens,
+        )
+        .expect("demo query");
+        assert_eq!(stats.pages_skipped, 0);
+        assert_eq!(stats.pages_total, 0);
+        assert_eq!(stats.pages_scanned, 0);
+        assert_eq!(out.row_count, 10);
     }
 }

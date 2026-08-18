@@ -2060,6 +2060,9 @@ pub fn demo_catalog() -> Catalog {
 /// hot path never allocates and never places large arrays on the stack.
 /// Checked entry point — identical to [`run_query`] (column resolution happens
 /// inside [`Engine::execute`] with BinOp-aware Filter walks).
+///
+/// Returns [`PushdownStats`]. In-memory catalog queries (demo tables, no
+/// `.zmap`) report a documented no-op fallback: `pages_skipped == 0`.
 pub fn run_query_checked(
     src: &str,
     catalog: &Catalog,
@@ -2067,8 +2070,10 @@ pub fn run_query_checked(
     out: &mut QueryResult,
     scratch: &mut RuntimeScratch,
     tokens: &mut [crate::lexer::Token; crate::lexer::MAX_TOKENS],
-) -> Result<(), EngineError> {
-    run_query(src, catalog, arena, out, scratch, tokens)
+) -> Result<PushdownStats, EngineError> {
+    run_query(src, catalog, arena, out, scratch, tokens)?;
+    // In-memory Table path has no page stream / zone map — graceful fallback.
+    Ok(PushdownStats::in_memory_fallback())
 }
 
 pub fn run_query(
@@ -2175,6 +2180,141 @@ pub struct MmapStreamStats {
     pub rows_scanned: u64,
     pub rows_kept: u64,
     pub _pad: [u8; 28],
+}
+
+/// Per-query zone-map predicate pushdown metrics (observable / returned).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct PushdownStats {
+    pub pages_total: u32,
+    pub pages_skipped: u32,
+    pub pages_scanned: u32,
+}
+
+impl PushdownStats {
+    /// In-memory / no-`.zmap` fallback: nothing to skip, nothing scanned as pages.
+    #[inline(always)]
+    pub const fn in_memory_fallback() -> Self {
+        Self {
+            pages_total: 0,
+            pages_skipped: 0,
+            pages_scanned: 0,
+        }
+    }
+}
+
+/// Filter an Int64 columnar stream with optional zone-map pushdown.
+///
+/// When `enable_pushdown` is true and `zmap` is `Some`, pages whose `[min,max]`
+/// cannot satisfy `op lit` are advanced via [`ColumnarFileStream::skip_next_page`]
+/// without decoding into scratch pads. When `zmap` is `None` or pushdown is
+/// forced off, every page is scanned (full-scan baseline).
+///
+/// Matching values are written densely into `out_values[0..*out_len)`
+/// (capped at `out_values.len()`, typically [`MAX_ROWS`]).
+pub fn execute_int64_filter_pushdown(
+    stream: &mut ColumnarFileStream,
+    zmap: Option<&crate::zonemap::ZoneMap>,
+    op: crate::zonemap::ZoneCmp,
+    lit: i64,
+    enable_pushdown: bool,
+    scratch: &mut RuntimeScratch,
+    out_values: &mut [i64],
+    out_len: &mut usize,
+    stats: &mut PushdownStats,
+) {
+    *stats = PushdownStats::default();
+    *out_len = 0;
+    stream.rewind();
+
+    let use_zmap = enable_pushdown && zmap.is_some();
+    let zmap_pages = zmap.map(|z| z.page_count()).unwrap_or(0);
+    // Prefer zonemap page count; else estimate from stream geometry.
+    if zmap_pages > 0 {
+        stats.pages_total = zmap_pages;
+    } else {
+        let pr = stream.page_rows().max(1);
+        let tr = stream.total_rows() as usize;
+        stats.pages_total = ((tr + pr - 1) / pr) as u32;
+    }
+
+    let mut page_i: u32 = 0;
+    loop {
+        if stream.cursor_row() as usize >= stream.total_rows() as usize {
+            break;
+        }
+        let may_skip = if use_zmap {
+            if let Some(z) = zmap {
+                if let Some(e) = z.entry(page_i as usize) {
+                    !e.can_satisfy(op, lit)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if may_skip {
+            let _ = stream.skip_next_page();
+            stats.pages_skipped = stats.pages_skipped.wrapping_add(1);
+            page_i = page_i.wrapping_add(1);
+            continue;
+        }
+
+        let page = match stream.next_page_chunk() {
+            Some(p) => p,
+            None => break,
+        };
+        stats.pages_scanned = stats.pages_scanned.wrapping_add(1);
+        let n = page.row_count as usize;
+        copy_page_to_scratch(page.rows, &mut scratch.key_buf, n);
+        let mut sel = SelectionVector::all(n);
+        let cmp = match op {
+            crate::zonemap::ZoneCmp::Gt => CmpOp::Gt,
+            crate::zonemap::ZoneCmp::Lt => CmpOp::Lt,
+            crate::zonemap::ZoneCmp::Eq => CmpOp::Eq,
+            // Gte/Lte/Ne: scalar path (grammar has no tokens; boundary tests use ZoneCmp).
+            crate::zonemap::ZoneCmp::Gte
+            | crate::zonemap::ZoneCmp::Lte
+            | crate::zonemap::ZoneCmp::Ne => {
+                let mut i = 0usize;
+                while i < n {
+                    let v = scratch.key_buf[i];
+                    let pass = match op {
+                        crate::zonemap::ZoneCmp::Gte => (v >= lit) as u8,
+                        crate::zonemap::ZoneCmp::Lte => (v <= lit) as u8,
+                        crate::zonemap::ZoneCmp::Ne => (v != lit) as u8,
+                        _ => 0,
+                    };
+                    sel.mask[i] &= pass;
+                    i += 1;
+                }
+                let mut i = 0usize;
+                while i < n && *out_len < out_values.len() {
+                    if sel.mask[i] != 0 {
+                        out_values[*out_len] = scratch.key_buf[i];
+                        *out_len += 1;
+                    }
+                    i += 1;
+                }
+                page_i = page_i.wrapping_add(1);
+                continue;
+            }
+        };
+        filter_i64_chunked(&scratch.key_buf, &mut sel, n, lit, cmp);
+        let mut i = 0usize;
+        while i < n && *out_len < out_values.len() {
+            if sel.mask[i] != 0 {
+                out_values[*out_len] = scratch.key_buf[i];
+                *out_len += 1;
+            }
+            i += 1;
+        }
+        page_i = page_i.wrapping_add(1);
+    }
 }
 
 /// Copy a zero-copy mmap page into `dst[0..n]` (fixed scratch — no heap).
