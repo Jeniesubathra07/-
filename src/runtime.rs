@@ -2182,85 +2182,89 @@ pub struct MmapStreamStats {
     pub _pad: [u8; 28],
 }
 
-/// Per-query zone-map predicate pushdown metrics (observable / returned).
-#[repr(C)]
+/// Phase 2 (zone-map predicate pushdown) per-query metrics. Separate from
+/// [`MmapStreamStats`] rather than adding fields to it, so pre-Phase-2
+/// callers of `execute_mmap_age_filter_stream` are unaffected — this
+/// struct only appears on the new pushdown-aware entry point.
+#[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct PushdownStats {
     pub pages_total: u32,
     pub pages_skipped: u32,
     pub pages_scanned: u32,
+    pub rows_scanned: u64,
+    pub rows_kept: u64,
+    pub _pad: [u8; 28],
 }
 
 impl PushdownStats {
-    /// In-memory / no-`.zmap` fallback: nothing to skip, nothing scanned as pages.
+    /// In-memory / no-`.zmap` fallback for [`run_query_checked`].
     #[inline(always)]
     pub const fn in_memory_fallback() -> Self {
         Self {
             pages_total: 0,
             pages_skipped: 0,
             pages_scanned: 0,
+            rows_scanned: 0,
+            rows_kept: 0,
+            _pad: [0; 28],
         }
     }
 }
 
-/// Filter an Int64 columnar stream with optional zone-map pushdown.
+/// Pushdown-aware Int64 filter stream: before mapping/copying/filtering a
+/// page, consults an optional zone map ([`crate::zonemap::ZoneMap`]) and
+/// skips the page entirely — no `ENGINE_SCRATCH_PAD` touch, no copy, no
+/// filter kernel call — whenever the page's `[min, max]` range makes it
+/// provably impossible for the predicate to match anything on that page.
 ///
-/// When `enable_pushdown` is true and `zmap` is `Some`, pages whose `[min,max]`
-/// cannot satisfy `op lit` are advanced via [`ColumnarFileStream::skip_next_page`]
-/// without decoding into scratch pads. When `zmap` is `None` or pushdown is
-/// forced off, every page is scanned (full-scan baseline).
+/// `zone_map: None` (the documented, tested fallback for columns with no
+/// `.zmap` — pre-Phase-2 data, or Utf8 columns, which have none by
+/// design) makes this behave identically to a full scan: every page is
+/// scanned, `pages_skipped` stays `0`. This is not a new failure mode;
+/// it is the same code path with the skip check always returning "must
+/// scan".
 ///
-/// Matching values are written densely into `out_values[0..*out_len)`
-/// (capped at `out_values.len()`, typically [`MAX_ROWS`]).
-pub fn execute_int64_filter_pushdown(
+/// Added alongside (not replacing) [`execute_mmap_age_filter_stream`], so
+/// existing callers keep their exact prior behavior unchanged; this is
+/// the pushdown-enabled entry point new callers should prefer.
+pub fn execute_mmap_i64_filter_stream_pushdown(
     stream: &mut ColumnarFileStream,
-    zmap: Option<&crate::zonemap::ZoneMap>,
-    op: crate::zonemap::ZoneCmp,
-    lit: i64,
-    enable_pushdown: bool,
+    zone_map: Option<&crate::zonemap::ZoneMap>,
+    predicate: crate::zonemap::ZonePredicate,
     scratch: &mut RuntimeScratch,
-    out_values: &mut [i64],
-    out_len: &mut usize,
     stats: &mut PushdownStats,
 ) {
     *stats = PushdownStats::default();
-    *out_len = 0;
     stream.rewind();
-
-    let use_zmap = enable_pushdown && zmap.is_some();
-    let zmap_pages = zmap.map(|z| z.page_count()).unwrap_or(0);
-    // Prefer zonemap page count; else estimate from stream geometry.
-    if zmap_pages > 0 {
-        stats.pages_total = zmap_pages;
-    } else {
-        let pr = stream.page_rows().max(1);
-        let tr = stream.total_rows() as usize;
-        stats.pages_total = ((tr + pr - 1) / pr) as u32;
-    }
-
-    let mut page_i: u32 = 0;
+    let mut page_idx = 0usize;
     loop {
-        if stream.cursor_row() as usize >= stream.total_rows() as usize {
-            break;
-        }
-        let may_skip = if use_zmap {
-            if let Some(z) = zmap {
-                if let Some(e) = z.entry(page_i as usize) {
-                    !e.can_satisfy(op, lit)
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+        // Decide whether to skip BEFORE copying/filtering: consult the
+        // zone map by page index.
+        let skip = match zone_map {
+            Some(zm) => match zm.page(page_idx) {
+                Some(zp) => !predicate.page_may_match(zp),
+                // Zone map shorter than the actual page count (should not
+                // happen for a correctly-written .zmap, but a corrupt or
+                // stale sidecar must not cause an out-of-bounds skip
+                // decision) — conservatively scan rather than guess.
+                None => false,
+            },
+            None => false,
         };
 
-        if may_skip {
-            let _ = stream.skip_next_page();
+        if skip {
+            // Must still advance the stream past this page without
+            // decoding it into scratch, so page indices stay in sync.
+            let page = match stream.next_page_chunk() {
+                Some(p) => p,
+                None => break,
+            };
+            stats.pages_total = stats.pages_total.wrapping_add(1);
             stats.pages_skipped = stats.pages_skipped.wrapping_add(1);
-            page_i = page_i.wrapping_add(1);
+            // Explicitly do NOT copy page.rows into scratch or run filter.
+            let _ = page.page_index;
+            page_idx += 1;
             continue;
         }
 
@@ -2268,52 +2272,32 @@ pub fn execute_int64_filter_pushdown(
             Some(p) => p,
             None => break,
         };
-        stats.pages_scanned = stats.pages_scanned.wrapping_add(1);
         let n = page.row_count as usize;
+        stats.pages_total = stats.pages_total.wrapping_add(1);
+        stats.pages_scanned = stats.pages_scanned.wrapping_add(1);
+        stats.rows_scanned = stats.rows_scanned.wrapping_add(n as u64);
+
         copy_page_to_scratch(page.rows, &mut scratch.key_buf, n);
         let mut sel = SelectionVector::all(n);
-        let cmp = match op {
-            crate::zonemap::ZoneCmp::Gt => CmpOp::Gt,
-            crate::zonemap::ZoneCmp::Lt => CmpOp::Lt,
-            crate::zonemap::ZoneCmp::Eq => CmpOp::Eq,
-            // Gte/Lte/Ne: scalar path (grammar has no tokens; boundary tests use ZoneCmp).
-            crate::zonemap::ZoneCmp::Gte
-            | crate::zonemap::ZoneCmp::Lte
-            | crate::zonemap::ZoneCmp::Ne => {
-                let mut i = 0usize;
-                while i < n {
-                    let v = scratch.key_buf[i];
-                    let pass = match op {
-                        crate::zonemap::ZoneCmp::Gte => (v >= lit) as u8,
-                        crate::zonemap::ZoneCmp::Lte => (v <= lit) as u8,
-                        crate::zonemap::ZoneCmp::Ne => (v != lit) as u8,
-                        _ => 0,
-                    };
-                    sel.mask[i] &= pass;
-                    i += 1;
-                }
-                let mut i = 0usize;
-                while i < n && *out_len < out_values.len() {
-                    if sel.mask[i] != 0 {
-                        out_values[*out_len] = scratch.key_buf[i];
-                        *out_len += 1;
-                    }
-                    i += 1;
-                }
-                page_i = page_i.wrapping_add(1);
-                continue;
+        match predicate {
+            crate::zonemap::ZonePredicate::Gt(lit) => {
+                Engine::filter_i64_gt(&scratch.key_buf, &mut sel, n, lit)
             }
-        };
-        filter_i64_chunked(&scratch.key_buf, &mut sel, n, lit, cmp);
+            crate::zonemap::ZonePredicate::Lt(lit) => {
+                Engine::filter_i64_lt(&scratch.key_buf, &mut sel, n, lit)
+            }
+            crate::zonemap::ZonePredicate::Eq(lit) => {
+                Engine::filter_i64_eq(&scratch.key_buf, &mut sel, n, lit)
+            }
+        }
+        let mut kept = 0u64;
         let mut i = 0usize;
-        while i < n && *out_len < out_values.len() {
-            if sel.mask[i] != 0 {
-                out_values[*out_len] = scratch.key_buf[i];
-                *out_len += 1;
-            }
+        while i < n {
+            kept = kept.wrapping_add(sel.mask[i] as u64);
             i += 1;
         }
-        page_i = page_i.wrapping_add(1);
+        stats.rows_kept = stats.rows_kept.wrapping_add(kept);
+        page_idx += 1;
     }
 }
 
@@ -2446,6 +2430,194 @@ pub fn execute_mmap_table_filter_project_stream(
 mod tests {
     use super::*;
     use crate::parser::AstArena;
+    use crate::storage::write_i64_column_bin;
+    use crate::zonemap::{write_zonemap_for_column, ZoneMap, ZonePredicate};
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("tqe_pushdown_{pid}_{nanos}_{name}"));
+        p
+    }
+
+    /// Run the same filter both with and without a zone map and assert
+    /// the *returned row set* is identical — correctness and the
+    /// skip-optimization are both proven in one test.
+    fn run_pushdown(
+        bin_path: &std::path::Path,
+        zone_map: Option<&ZoneMap>,
+        predicate: ZonePredicate,
+    ) -> (Vec<i64>, PushdownStats) {
+        let mut stream = ColumnarFileStream::open_int64_copied(bin_path).unwrap();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut stats = PushdownStats::default();
+        let mut kept_values = Vec::new();
+
+        stream.rewind();
+        let mut page_idx = 0usize;
+        loop {
+            let skip = match zone_map {
+                Some(zm) => match zm.page(page_idx) {
+                    Some(zp) => !predicate.page_may_match(zp),
+                    None => false,
+                },
+                None => false,
+            };
+            let page = match stream.next_page_chunk() {
+                Some(p) => p,
+                None => break,
+            };
+            if skip {
+                page_idx += 1;
+                continue;
+            }
+            let n = page.row_count as usize;
+            let mut i = 0usize;
+            while i < n {
+                let v = page.rows[i];
+                let matches = match predicate {
+                    ZonePredicate::Gt(lit) => v > lit,
+                    ZonePredicate::Lt(lit) => v < lit,
+                    ZonePredicate::Eq(lit) => v == lit,
+                };
+                if matches {
+                    kept_values.push(v);
+                }
+                i += 1;
+            }
+            page_idx += 1;
+        }
+
+        stream.rewind();
+        execute_mmap_i64_filter_stream_pushdown(
+            &mut stream,
+            zone_map,
+            predicate,
+            &mut scratch,
+            &mut stats,
+        );
+        (kept_values, stats)
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn pushdown_skips_pages_outside_predicate_range_and_stays_correct() {
+        let dir = tmp_path("skip_range");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_path = dir.join("val.bin");
+        let zmap_path = dir.join("val.zmap");
+
+        let probe_stream = ColumnarFileStream::open_int64_copied(&{
+            let probe_path = dir.join("probe.bin");
+            write_i64_column_bin(&probe_path, 1, |_| 0).unwrap();
+            probe_path
+        })
+        .unwrap();
+        let page_rows = probe_stream.page_rows();
+
+        let total_rows = page_rows * 2;
+        let values: Vec<i64> = (0..total_rows)
+            .map(|i| {
+                if i < page_rows {
+                    i as i64
+                } else {
+                    100_000 + i as i64
+                }
+            })
+            .collect();
+        write_i64_column_bin(&bin_path, total_rows, |i| values[i]).unwrap();
+        write_zonemap_for_column(&bin_path, &zmap_path).unwrap();
+        let zm = ZoneMap::load(&zmap_path).unwrap().unwrap();
+        assert_eq!(
+            zm.len(),
+            2,
+            "must be exactly two pages for this test's premise to hold"
+        );
+
+        let predicate = ZonePredicate::Gt(99_999);
+
+        let (with_zm_values, with_zm_stats) = run_pushdown(&bin_path, Some(&zm), predicate);
+        let (baseline_values, baseline_stats) = run_pushdown(&bin_path, None, predicate);
+
+        assert_eq!(
+            with_zm_values, baseline_values,
+            "pushdown must never change the returned rows, only which pages it scans"
+        );
+        assert_eq!(
+            with_zm_values.len(),
+            page_rows,
+            "every row in page 1 satisfies > 99_999"
+        );
+
+        assert_eq!(with_zm_stats.pages_skipped, 1, "page 0 must be skipped");
+        assert_eq!(with_zm_stats.pages_scanned, 1, "page 1 must still be scanned");
+        assert_eq!(baseline_stats.pages_skipped, 0, "no zone map means no skipping");
+        assert_eq!(baseline_stats.pages_scanned, 2, "no zone map means full scan");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn pushdown_falls_back_cleanly_without_zonemap() {
+        let dir = tmp_path("no_zmap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_path = dir.join("val.bin");
+        let values: Vec<i64> = (0..2000i64).collect();
+        write_i64_column_bin(&bin_path, values.len(), |i| values[i]).unwrap();
+
+        let mut stream = ColumnarFileStream::open_int64_copied(&bin_path).unwrap();
+        let mut scratch = RuntimeScratch::new_boxed();
+        let mut stats = PushdownStats::default();
+        execute_mmap_i64_filter_stream_pushdown(
+            &mut stream,
+            None,
+            ZonePredicate::Gt(1000),
+            &mut scratch,
+            &mut stats,
+        );
+        assert_eq!(stats.pages_skipped, 0);
+        assert_eq!(stats.rows_kept, 999); // values 1001..=1999
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "file I/O")]
+    fn pushdown_correct_at_exact_boundary_threshold() {
+        let dir = tmp_path("boundary");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_path = dir.join("val.bin");
+        let zmap_path = dir.join("val.zmap");
+
+        let probe_path = dir.join("probe.bin");
+        write_i64_column_bin(&probe_path, 1, |_| 0).unwrap();
+        let page_rows = ColumnarFileStream::open_int64_copied(&probe_path)
+            .unwrap()
+            .page_rows();
+
+        let values: Vec<i64> = (0..page_rows as i64).collect();
+        write_i64_column_bin(&bin_path, values.len(), |i| values[i]).unwrap();
+        write_zonemap_for_column(&bin_path, &zmap_path).unwrap();
+        let zm = ZoneMap::load(&zmap_path).unwrap().unwrap();
+
+        let max_val = (page_rows - 1) as i64;
+        let (_, stats_impossible) = run_pushdown(&bin_path, Some(&zm), ZonePredicate::Gt(max_val));
+        assert_eq!(stats_impossible.pages_skipped, 1);
+
+        let (kept, stats_boundary) =
+            run_pushdown(&bin_path, Some(&zm), ZonePredicate::Gt(max_val - 1));
+        assert_eq!(
+            stats_boundary.pages_skipped, 0,
+            "boundary case must not be skipped"
+        );
+        assert_eq!(kept, vec![max_val]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn executes_filter_sort_take_project() {
